@@ -1,0 +1,55 @@
+{
+  "_comment": "vulnagent config - copy to /etc/vulnagent/config.json. Keys starting with _ are ignored.",
+
+  "state_dir": "/var/lib/vulnagent",
+
+  "scan_os_packages": true,
+  "scan_runtimes": true,
+  "scan_libraries": true,
+  "scan_paths": ["/opt", "/srv", "/var/www", "/usr/local", "/usr/lib", "/usr/share", "/home", "/root"],
+  "exclude_paths": ["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp", "/var/lib/docker",
+                    "/var/lib/containerd", "/snap", "/var/lib/vulnagent", "/usr/lib/modules",
+                    "/usr/lib/firmware", "/usr/share/doc", "/usr/share/man", "/usr/share/locale",
+                    "/usr/share/icons"],
+  "max_scan_depth": 14,
+  "same_filesystem": true,
+  "max_archive_mb": 300,
+  "refresh_package_index": true,
+
+  "_os_ecosystem_override": "Auto for Debian/Ubuntu/Alpine. For Kali/Raspbian/other derivatives set e.g. Debian:13",
+  "os_ecosystem_override": "",
+  "ignore_unfixed_os": true,
+  "report_os_managed_libraries": true,
+
+  "min_severity": "LOW",
+  "ignore_vulns": [],
+  "exclude_packages": [],
+
+  "_auto_apply": "false = 'vulnagent run' only reports. true = it patches according to 'patch' below.",
+  "auto_apply": false,
+  "patch": {
+    "_os": "none | security (distro security repo only) | vulnerable (security + packages with known CVEs) | all",
+    "os": "security",
+    "pypi": false,
+    "npm": false,
+    "composer": false,
+    "rubygems": false,
+    "pip_allow_system": false,
+    "restart_services": false,
+    "auto_reboot": false,
+    "reboot_delay_minutes": 5
+  },
+
+  "notify": {
+    "_webhook_url": "Slack / Mattermost / Discord / Teams-compatible incoming webhook",
+    "webhook_url": "",
+    "only_on_findings": true,
+    "_report_upload_url": "optional: POST the JSON report to a central collector",
+    "report_upload_url": "",
+    "report_upload_token": ""
+  },
+
+  "http_timeout": 30,
+  "workers": 16,
+  "keep_reports": 30
+}

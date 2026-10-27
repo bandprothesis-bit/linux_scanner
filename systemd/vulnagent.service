@@ -1,0 +1,15 @@
+[Unit]
+Description=vulnagent - vulnerability scan and auto-patching
+Documentation=file:///usr/local/share/doc/vulnagent/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vulnagent -c /etc/vulnagent/config.json run
+# exit 1 = vulnerabilities still present; that is a report, not a unit failure
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h
+PrivateTmp=true
