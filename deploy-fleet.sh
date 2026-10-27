@@ -11,7 +11,7 @@ CONFIG=${2:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 TARBALL=$(mktemp /tmp/vulnagent.XXXXXX.tgz)
 trap 'rm -f "$TARBALL"' EXIT
-tar -C "$HERE" -czf "$TARBALL" vulnagent.py config.example.json install.sh README.md systemd
+tar -C "$HERE" -czf "$TARBALL" vulnagent.py config.example.json install.sh bootstrap.sh README.md systemd
 
 grep -v '^\s*#' "$HOSTS" | grep -v '^\s*$' | while read -r host; do
     echo "==> $host"

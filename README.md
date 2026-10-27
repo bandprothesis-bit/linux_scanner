@@ -14,6 +14,34 @@ A Linux agent that finds out what is installed on the machine, checks it against
 | Node libraries | `node_modules/**/package.json` (projects and global) | OSV (npm) |
 | Ruby gems | `Gemfile.lock` | OSV (RubyGems) |
 
+## Getting it onto a machine
+
+The repository is private, so each machine has to authenticate. Copy `bootstrap.sh` to the machine (scp, or paste it into a file) and use one of the two options below.
+
+**Option A: SSH deploy key, one per machine.**
+
+```bash
+sh bootstrap.sh
+```
+
+The first run creates `~/.ssh/linux_scanner_deploy` and prints its public key. Add that key under the repo's **Settings → Deploy keys** with write access left unticked, then run the script again.
+
+**Option B: one read-only token for every machine.** Create the token under GitHub **Settings → Developer settings → Fine-grained tokens**, with access to this repository only and the permission *Contents: Read-only*. This option needs only curl, not git.
+
+```bash
+GITHUB_TOKEN=github_pat_xxx sh bootstrap.sh
+```
+
+Either way the code lands in `~/linux_scanner` (change it with `DEST=`). Re-running the script updates it to the latest version. `--scan` runs a scan right away, and `--install` installs the daily service.
+
+You can run it straight from that folder without installing:
+
+```bash
+sudo python3 ~/linux_scanner/vulnagent.py scan
+```
+
+Without an `/etc/vulnagent/config.json`, it uses the built-in defaults, so nothing is patched unless you pass `patch --apply`.
+
 ## Quick start
 
 ```bash
