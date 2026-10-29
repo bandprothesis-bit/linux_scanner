@@ -1,0 +1,29 @@
+{
+  "_comment": "vulnagent -> DefectDojo. Copy to /etc/vulnagent/defectdojo.json (mode 0600: it holds the API token). Keys starting with _ are ignored.",
+
+  "_url": "Base URL of your DefectDojo server, without /api/v2",
+  "url": "https://defectdojo.example.local",
+  "_api_token": "DefectDojo -> your user (top right) -> API v2 Key. Can also be given as env DD_API_TOKEN.",
+  "api_token": "",
+
+  "_product_type": "Created automatically if it does not exist. Use e.g. one per site or department.",
+  "product_type": "Linux servers",
+  "_product_name": "One product per machine. {host} = FQDN, {short} = short hostname",
+  "product_name": "{host}",
+  "engagement_name": "vulnagent",
+  "test_title": "vulnagent",
+
+  "close_old_findings": true,
+  "minimum_severity": "Info",
+  "include_os_managed_libraries": true,
+  "include_runtimes": true,
+  "include_pending_advisories": true,
+
+  "agent_config": "/etc/vulnagent/config.json",
+  "report": "",
+
+  "_verify_tls": "Set ca_file to your internal CA for a self-signed certificate rather than turning verification off",
+  "verify_tls": true,
+  "ca_file": "",
+  "timeout": 600
+}

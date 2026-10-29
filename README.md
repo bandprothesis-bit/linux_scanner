@@ -134,6 +134,8 @@ Copy `config.example.json` to `/etc/vulnagent/config.json`. The most important k
 
 This copies the agent to every `user@host` in `hosts.txt` over SSH and installs it with sudo. Each host then reports to the same webhook or collector. With Ansible or Salt, ship `vulnagent.py`, the config and the two systemd units the same way.
 
+For a central web console, send every machine's findings to DefectDojo with the add-on in [`defectdojo/`](defectdojo/README.md).
+
 ## Limitations
 
 - **Distro backports:** Debian, Ubuntu, RHEL, Rocky and SUSE often fix a CVE without changing the upstream version number. For OS packages the agent uses the distro's own advisories, which handles this.
