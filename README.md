@@ -121,6 +121,7 @@ Copy `config.example.json` to `/etc/vulnagent/config.json`. The most important k
 - `scan_paths` / `exclude_paths`: where to look for application libraries. Package caches (`.m2`, `.gradle`, `.npm`, `.cache`) and VCS directories are always skipped.
 - `os_ecosystem_override`: OSV ecosystem for OS packages. Debian, Ubuntu and Alpine are detected automatically. Derivatives such as Kali or Raspbian need it set explicitly, for example `"Debian:13"`.
 - `ignore_unfixed_os`: hides distro CVEs that have no fix yet (default true; there are usually hundreds).
+- `check_backports`: hides findings in OS-shipped libraries when the OS package's changelog names the CVE (default true).
 - `min_severity`, `ignore_vulns` (IDs or CVE aliases), `exclude_packages`.
 - `notify.webhook_url`: Slack, Mattermost, Discord or Teams incoming webhook; sends a summary with the CRITICAL/HIGH items.
 - `notify.report_upload_url` and `report_upload_token`: POST the full JSON report to a central collector, for fleet dashboards or a SIEM.
@@ -135,7 +136,11 @@ This copies the agent to every `user@host` in `hosts.txt` over SSH and installs 
 
 ## Limitations
 
-- **Distro backports:** Debian, Ubuntu and RHEL often fix a CVE without changing the upstream version number. For OS packages the agent uses the distro's own advisories, which handles this. For libraries *shipped by OS packages* (for example `/usr/lib/python3/dist-packages`) and for runtime "outdated" checks, a match can be a false positive. These are grouped as "shipped inside OS packages" and fixed through OS updates only.
+- **Distro backports:** Debian, Ubuntu, RHEL, Rocky and SUSE often fix a CVE without changing the upstream version number. For OS packages the agent uses the distro's own advisories, which handles this.
+
+  For libraries *shipped by OS packages* (for example `/usr/lib/python3.6/site-packages` on Rocky 8), the agent reads the owning package's changelog (`rpm -q --changelog`, or `/usr/share/doc/<pkg>/changelog.Debian.gz`). When the changelog names the CVE, the finding is hidden. The report shows how many were hidden and lists them under `backported` in the JSON. Turn this off with `"check_backports": false`.
+
+  Backports whose changelog does not name the CVE, and the runtime "outdated" checks, can still be false positives. These findings are grouped as "shipped inside OS packages" and fixed through OS updates only. Never upgrade them with `pip` or `npm`, because system tools such as `dnf` depend on them.
 - **RPM distros:** OS CVE details come from `dnf/yum updateinfo` (advisory IDs), not OSV.
 - **Unidentified JARs:** JARs without `META-INF/maven/.../pom.properties` cannot be identified reliably. They are counted in the report but not checked.
 - **Containers:** The agent does not scan container images or statically linked binaries other than Go. Use Trivy or Grype for container images.

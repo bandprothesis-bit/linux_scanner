@@ -20,6 +20,8 @@
   "os_ecosystem_override": "",
   "ignore_unfixed_os": true,
   "report_os_managed_libraries": true,
+  "_check_backports": "Hide OS-managed library findings whose CVE is named in the owning OS package changelog (fix backported by RHEL/Rocky/SUSE/Debian)",
+  "check_backports": true,
 
   "min_severity": "LOW",
   "ignore_vulns": [],

@@ -28,6 +28,7 @@ import concurrent.futures
 import datetime
 import fcntl
 import glob
+import gzip
 import html
 import io
 import json
@@ -78,6 +79,9 @@ DEFAULT_CONFIG = {
     "os_ecosystem_override": "",
     "ignore_unfixed_os": True,
     "report_os_managed_libraries": True,
+    # Hide findings in OS-managed libraries when the owning OS package's
+    # changelog names the CVE (fix backported without a version change).
+    "check_backports": True,
     "min_severity": "LOW",
     "ignore_vulns": [],
     "exclude_packages": [],
@@ -1146,6 +1150,49 @@ def collect(cfg, args, state_dir, refresh=True):
     return inv
 
 
+class Backports:
+    """Fixes a distribution backported into an older upstream version.
+
+    RHEL/Rocky/SUSE/Debian/Ubuntu patch CVEs without changing the upstream
+    version, so OSV reports them against e.g. urllib3 1.24.2 forever. When the
+    owning OS package's changelog names the CVE, the fix is in."""
+
+    CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}")
+
+    def __init__(self, pm):
+        self.pm = pm
+        self.owners = {}
+        self.cves = {}
+
+    def _changelog_cves(self, pkg):
+        if pkg not in self.cves:
+            text = ""
+            if self.pm in ("dnf", "yum", "zypper"):
+                rc, out, _ = run(["rpm", "-q", "--changelog", pkg], timeout=120)
+                text = out if rc == 0 else ""
+            elif self.pm == "apt":
+                try:
+                    with gzip.open("/usr/share/doc/%s/changelog.Debian.gz" % pkg, "rt",
+                                   encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    pass
+            self.cves[pkg] = set(self.CVE_RE.findall(text.upper()))
+        return self.cves[pkg]
+
+    def fixed_by(self, lib, cves):
+        """The OS package whose changelog names one of `cves`, else None."""
+        if not cves or self.pm not in ("apt", "dnf", "yum", "zypper"):
+            return None
+        path = lib.get("dist_dir") or lib.get("archive") or lib["location"]
+        if path not in self.owners:
+            self.owners[path] = owner_package(self.pm, path)
+        pkg = self.owners[path]
+        if pkg and self._changelog_cves(pkg) & set(c.upper() for c in cves):
+            return pkg
+        return None
+
+
 def assess(inv, cfg, state_dir):
     osv = Osv(os.path.join(state_dir, "cache"), cfg["http_timeout"], cfg["workers"])
     eco_os = inv["osv_ecosystem"]
@@ -1201,6 +1248,8 @@ def assess(inv, cfg, state_dir):
                                               "location": ""})
                 if f and not (cfg["ignore_unfixed_os"] and not f["fixed_in"]):
                     findings.append(f)
+    bp = Backports(inv["package_manager"]) if cfg["check_backports"] else None
+    inv["backported"] = []
     for l in libs:
         if l["name"] in excl:
             continue
@@ -1209,6 +1258,13 @@ def assess(inv, cfg, state_dir):
                      if l.get(k) is not None}
             extra["layer"] = "library"
             f = mk(v, l["ecosystem"], l["name"], l["version"], extra)
+            if f and bp and l["manager"] == "os":
+                pkg = bp.fixed_by(l, f["cves"])
+                if pkg:
+                    inv["backported"].append({"ecosystem": l["ecosystem"], "name": l["name"],
+                                              "version": l["version"], "id": f["id"], "cves": f["cves"],
+                                              "location": l.get("location"), "os_package": pkg})
+                    continue
             if f:
                 findings.append(f)
     for rt in inv["runtimes"]:
@@ -1218,6 +1274,9 @@ def assess(inv, cfg, state_dir):
                                                           "location": rt["path"]})
                 if f:
                     findings.append(f)
+    if inv["backported"]:
+        log.info("%d findings hidden: fix backported, CVE named in the OS package changelog",
+                 len(inv["backported"]))
     findings.sort(key=lambda f: (-sev_rank(f["severity"]), -(f["score"] or 0), f["name"]))
     return findings
 
@@ -1508,6 +1567,7 @@ def build_report(inv, findings, actions, applied, restart, prev):
             "vulnerable_packages": len(vulnerable),
             "fixable": sum(1 for f in findings if f["fixed_in"]),
             "new_since_last_run": len(new),
+            "backported_hidden": len(inv.get("backported", [])),
             "os_updates_pending": len(inv["os_updates"]),
             "os_security_updates_pending": sum(1 for u in inv["os_updates"] if u["security"]),
             "eol_runtimes": sum(1 for r in inv["runtimes"] if r["status"] == "eol"),
@@ -1516,6 +1576,7 @@ def build_report(inv, findings, actions, applied, restart, prev):
         "runtimes": inv["runtimes"],
         "findings": findings,
         "new_findings": [keyf(f) for f in new],
+        "backported": inv.get("backported", []),
         "os_updates": inv["os_updates"],
         "plan": actions,
         "restart": restart,
@@ -1564,6 +1625,9 @@ def text_report(rep, limit=40, color=False):
         ", ".join("%s %d" % (k, v) for k, v in s["by_severity"].items() if v) or "none"))
     if s["new_since_last_run"]:
         out.append("  %d new since last run" % s["new_since_last_run"])
+    if s.get("backported_hidden"):
+        out.append("  %d more hidden: already fixed by the distribution (CVE in the OS package changelog)"
+                   % s["backported_hidden"])
     for i, ((eco, name, ver, loc), fs) in enumerate(sorted(groups.items(),
                                                         key=lambda kv: (-max(sev_rank(f["severity"]) for f in kv[1]),
                                                                         kv[0][1]))):
