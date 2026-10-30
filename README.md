@@ -13,6 +13,7 @@ A Linux agent that finds out what is installed on the machine, checks it against
 | Python libraries | `*.dist-info` / `*.egg-info` in venvs, `/usr/local`, user site | OSV (PyPI) |
 | Node libraries | `node_modules/**/package.json` (projects and global) | OSV (npm) |
 | Ruby gems | `Gemfile.lock` | OSV (RubyGems) |
+| Certificates | `.pem/.crt/.cer/.der` files under `/etc/ssl`, `/etc/pki`, `/etc/letsencrypt/live`, web/mail server folders, `/opt`, `/srv`, plus every certificate file named in nginx, Apache, HAProxy, Postfix, Dovecot, MySQL or PostgreSQL configs | Expiry date: expired, or expiring within `cert_warning_days` (30) |
 
 ## Getting it onto a machine
 
@@ -69,7 +70,7 @@ Reports are written to `/var/lib/vulnagent/reports/` as `latest.json`, `latest.h
 
 | Command | Does |
 |---|---|
-| `vulnagent inventory [--json]` | Lists packages, runtimes and libraries. No network access. |
+| `vulnagent inventory [--json]` | Lists packages, runtimes, libraries and certificates. No network access. |
 | `vulnagent scan` | Inventory, vulnerability lookup and remediation plan. Read-only. |
 | `vulnagent patch [--apply] [--os-mode MODE] [--libs]` | Like `scan`, then executes the plan when `--apply` is given, then rescans. |
 | `vulnagent run` | Agent mode used by the timer. Patches only if `"auto_apply": true`, then reports and notifies. |
@@ -122,6 +123,7 @@ Copy `config.example.json` to `/etc/vulnagent/config.json`. The most important k
 - `os_ecosystem_override`: OSV ecosystem for OS packages. Debian, Ubuntu and Alpine are detected automatically. Derivatives such as Kali or Raspbian need it set explicitly, for example `"Debian:13"`.
 - `ignore_unfixed_os`: hides distro CVEs that have no fix yet (default true; there are usually hundreds).
 - `check_backports`: hides findings in OS-shipped libraries when the OS package's changelog names the CVE (default true).
+- `scan_certificates`, `cert_paths`, `cert_warning_days`: the certificate check. The distribution's own CA bundle (`/usr/share/ca-certificates`, `/etc/pki/ca-trust/extracted`) and any file holding more than 20 certificates are skipped, because those are trust stores, not installed certificates. CAs you added yourself (`/usr/local/share/ca-certificates`, `/etc/pki/ca-trust/source/anchors`) are reported. Test certificates inside `node_modules`, `site-packages`, `vendor` and `test` folders are ignored.
 - `min_severity`, `ignore_vulns` (IDs or CVE aliases), `exclude_packages`.
 - `notify.webhook_url`: Slack, Mattermost, Discord or Teams incoming webhook; sends a summary with the CRITICAL/HIGH items.
 - `notify.report_upload_url` and `report_upload_token`: POST the full JSON report to a central collector, for fleet dashboards or a SIEM.
@@ -144,6 +146,7 @@ For a central web console, send every machine's findings to DefectDojo with the 
 
   Backports whose changelog does not name the CVE, and the runtime "outdated" checks, can still be false positives. These findings are grouped as "shipped inside OS packages" and fixed through OS updates only. Never upgrade them with `pip` or `npm`, because system tools such as `dnf` depend on them.
 - **RPM distros:** OS CVE details come from `dnf/yum updateinfo` (advisory IDs), not OSV.
+- **Certificates in keystores:** Java keystores (`.jks`, `.p12`) are not opened, because they need a password. Add a PEM copy of the certificate to `cert_paths` if you want it watched.
 - **Unidentified JARs:** JARs without `META-INF/maven/.../pom.properties` cannot be identified reliably. They are counted in the report but not checked.
 - **Containers:** The agent does not scan container images or statically linked binaries other than Go. Use Trivy or Grype for container images.
 - **Network access:** The agent needs outbound HTTPS to `api.osv.dev` and `endoflife.date`. Vulnerability details are cached in `/var/lib/vulnagent/cache`.

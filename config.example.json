@@ -16,6 +16,15 @@
   "max_archive_mb": 300,
   "refresh_package_index": true,
 
+  "_scan_certificates": "Find X.509 certificate files (and those named in nginx/apache/haproxy/postfix/... configs). The distribution's CA bundle is skipped.",
+  "scan_certificates": true,
+  "cert_paths": ["/etc/letsencrypt/live", "/usr/local/share/ca-certificates", "/etc/pki/ca-trust/source/anchors",
+                 "/etc/ssl", "/etc/pki", "/etc/nginx", "/etc/apache2", "/etc/httpd", "/etc/haproxy", "/etc/postfix",
+                 "/etc/dovecot", "/etc/mysql", "/etc/postgresql", "/etc/openvpn", "/etc/docker",
+                 "/etc/kubernetes/pki", "/var/lib/kubelet/pki", "/etc/grafana", "/usr/local/etc", "/opt", "/srv"],
+  "_cert_warning_days": "Certificates expiring within this many days are reported as expiring",
+  "cert_warning_days": 30,
+
   "_os_ecosystem_override": "Auto for Debian/Ubuntu/Alpine. For Kali/Raspbian/other derivatives set e.g. Debian:13",
   "os_ecosystem_override": "",
   "ignore_unfixed_os": true,

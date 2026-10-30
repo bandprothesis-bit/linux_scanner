@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "include_os_managed_libraries": True,
     "include_runtimes": True,        # EOL / outdated PHP, Java, Python, ...
     "include_pending_advisories": True,  # RPM/SUSE: pending security errata as findings
+    "include_certificates": True,    # expired / expiring certificates
+    "include_valid_certificates": True,  # also list valid certificates, as Info (inventory)
     "agent_config": "/etc/vulnagent/config.json",
     "report": "",                    # default: <state_dir>/reports/latest.json
     "verify_tls": True,
@@ -208,6 +210,43 @@ def advisory_findings(updates):
     return out
 
 
+def cert_finding(c, warn_days):
+    """One finding per certificate. The title names the expiry band, so the finding is
+    replaced (old one closed) when the certificate moves to a more urgent band."""
+    if c["status"] == "expired":
+        title, sev = "Certificate expired: " + c["name"], "High"
+        mitigation = "Expired on %s (%d days ago). Renew or replace it, or delete it if nothing uses it." % (
+            c["not_after"], -c["days_left"])
+    elif c["days_left"] <= 7:
+        title, sev = "Certificate expires within 7 days: " + c["name"], "High"
+        mitigation = "Expires on %s, in %d days. Renew it now." % (c["not_after"], c["days_left"])
+    elif c["status"] == "expiring":
+        title, sev = "Certificate expires within %d days: %s" % (warn_days, c["name"]), "Medium"
+        mitigation = "Expires on %s, in %d days. Renew it before then." % (c["not_after"], c["days_left"])
+    else:
+        title, sev = "Certificate: " + c["name"], "Info"
+        mitigation = "Valid until %s (%d days). Nothing to do yet." % (c["not_after"], c["days_left"])
+    desc = ["**Subject:** " + (c["subject"] or "(empty)"), "**Issuer:** " + (c["issuer"] or "(empty)")]
+    if c["self_signed"]:
+        desc[-1] += " (self-signed)"
+    desc += ["**Serial number:** " + c["serial"], "**Valid from:** " + c["not_before"],
+             "**Valid until:** " + c["not_after"]]
+    if c["dns_names"]:
+        desc.append("**DNS names:** " + ", ".join(c["dns_names"][:20]) +
+                    (" and %d more" % (len(c["dns_names"]) - 20) if len(c["dns_names"]) > 20 else ""))
+    desc += ["**SHA-256 fingerprint:** " + c["sha256"], "**SHA-1 thumbprint:** " + c["sha1"],
+             "**File:** " + ", ".join(c["paths"])]
+    if c["used_by"]:
+        desc.append("**Used in:** " + ", ".join(c["used_by"]))
+    return {
+        "title": clip(title, 500), "severity": sev, "description": "\n".join(desc), "mitigation": mitigation,
+        "component_name": clip(c["name"], 200), "file_path": clip(c["paths"][0], 4000),
+        "vuln_id_from_tool": "certificate-" + c["status"], "unique_id_from_tool": "cert|" + c["sha256"],
+        "static_finding": True, "dynamic_finding": False,
+        "tags": ["vulnagent", "certificate", c["status"]] + (["self-signed"] if c["self_signed"] else []),
+    }
+
+
 def convert(rep, cfg):
     findings = []
     for f in rep.get("findings", []):
@@ -220,6 +259,9 @@ def convert(rep, cfg):
     # the distro's security errata are the OS findings.
     if cfg["include_pending_advisories"] and not rep.get("osv_ecosystem"):
         findings += advisory_findings(rep.get("os_updates", []))
+    if cfg["include_certificates"]:
+        findings += [cert_finding(c, rep.get("cert_warning_days", 30)) for c in rep.get("certificates", [])
+                     if c["status"] != "ok" or cfg["include_valid_certificates"]]
     for x in findings:
         if not x.get("vulnerability_ids"):
             x.pop("vulnerability_ids", None)
@@ -230,9 +272,10 @@ def convert(rep, cfg):
         "name": "vulnagent",
         "type": SCAN_TYPE,
         "version": rep.get("agent", "").replace("vulnagent ", ""),
-        "description": "%s - %s, kernel %s, %d OS packages, %d OS updates pending (%d security)" % (
+        "description": "%s - %s, kernel %s, %d OS packages, %d OS updates pending (%d security), %d certificates" % (
             rep.get("host"), (rep.get("os") or {}).get("name"), rep.get("kernel"),
-            s.get("os_packages", 0), s.get("os_updates_pending", 0), s.get("os_security_updates_pending", 0)),
+            s.get("os_packages", 0), s.get("os_updates_pending", 0), s.get("os_security_updates_pending", 0),
+            s.get("certificates", 0)),
         "findings": findings,
     }
 

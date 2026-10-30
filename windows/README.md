@@ -11,6 +11,7 @@ Every night, as a scheduled task running as SYSTEM, it does this:
 | **Runtimes and SQL Server**: .NET, Java (Oracle, Temurin), Python, Node.js, PowerShell 7, SQL Server | Installed programs, compared with endoflife.date | High when end-of-life. Medium when patch releases (or SQL Server CUs) are missing. |
 | **Outdated applications** such as Chrome, 7-Zip and Notepad++ | `winget upgrade`, only where winget is installed | Low, with the version to update to |
 | **Restart pending** after updates | Registry | Low |
+| **Certificates** in the computer's Personal, Web Hosting and Remote Desktop stores | Certificate store, plus the IIS/HTTP.sys bindings and the Remote Desktop certificate setting to show where each one is used | High when expired or expiring within 7 days. Medium within 30 days. Every other certificate is listed as Info, as an inventory. |
 
 Each machine becomes its own DefectDojo product under the product type **Windows servers**. Fixed findings close automatically, new ones are added, and notes and risk acceptances are kept, the same as on Linux.
 
@@ -91,6 +92,10 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | `include_runtimes` | `true` | The end-of-life and patch checks for .NET, Java, Python, Node.js, PowerShell and SQL Server. |
 | `include_winget` | `true` | Outdated applications, where winget is installed. |
 | `eol_warning_days` | `90` | Warn this many days before Windows support ends. |
+| `include_certificates` | `true` | The certificate check. |
+| `include_valid_certificates` | `true` | Also list valid certificates, as Info. Set to `false` to see only expired and expiring ones. |
+| `certificate_stores` | `["My", "WebHosting", "Remote Desktop"]` | Stores under `Cert:\LocalMachine` to check. Add `"Root"` and `"CA"` to include trusted root and intermediate CAs. Those also contain old Microsoft roots that Windows keeps on purpose, which then show as expired. |
+| `cert_warning_days` | `30` | Report certificates expiring within this many days as Medium. |
 | `install_updates` | `none` | `security` or `all`: install updates before each scan (see below). |
 | `reboot_after_updates` | `false` | Restart 10 minutes after the scan when installed updates need it. |
 | `winget_upgrade` | `false` | Also run `winget upgrade --all`. This accepts the apps' licence terms. |

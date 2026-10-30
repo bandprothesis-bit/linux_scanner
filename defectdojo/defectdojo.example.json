@@ -18,6 +18,10 @@
   "include_os_managed_libraries": true,
   "include_runtimes": true,
   "include_pending_advisories": true,
+  "_include_certificates": "Expired certificates are High, expiring within 7 days High, within cert_warning_days (vulnagent config, default 30) Medium",
+  "include_certificates": true,
+  "_include_valid_certificates": "Also list every valid certificate as an Info finding (certificate inventory)",
+  "include_valid_certificates": true,
 
   "agent_config": "/etc/vulnagent/config.json",
   "report": "",

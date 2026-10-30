@@ -18,6 +18,10 @@ What gets uploaded from each machine:
 | Pending security errata (Rocky, RHEL, Alma, SUSE) | One finding per advisory (`RLSA-…`, `RHSA-…`), with the advisory's severity |
 | End-of-life runtime | High |
 | Runtime missing patch releases | Low if the OS package manages it, Medium otherwise |
+| Certificate expired | High |
+| Certificate expiring within 7 days | High |
+| Certificate expiring within 30 days (`cert_warning_days` in `/etc/vulnagent/config.json`) | Medium |
+| Every other certificate on the machine | Info: an inventory, with subject, issuer, DNS names, fingerprints, file and the server config that uses it |
 
 Reporting is one-way. Patching is still controlled by each machine's `/etc/vulnagent/config.json`.
 
@@ -124,13 +128,15 @@ Make `my-defectdojo.json` from `defectdojo.example.json`, with your URL and toke
 | `include_os_managed_libraries` | `true` | Libraries installed by OS packages, tagged `os-managed`. They may be false positives because of distro backports. Set to `false` to leave them out. |
 | `include_runtimes` | `true` | Upload EOL or outdated runtime findings. |
 | `include_pending_advisories` | `true` | On RPM and SUSE machines, upload pending security errata as findings. |
+| `include_certificates` | `true` | Upload the certificate findings. |
+| `include_valid_certificates` | `true` | Also upload valid certificates, as Info findings. Set to `false` to see only expired and expiring ones. |
 | `minimum_severity` | `Info` | Findings below this severity are not imported. |
 | `ca_file` / `verify_tls` | – / `true` | For a DefectDojo server with an internal or self-signed certificate. |
 
 ## Useful DefectDojo views
 
 - **Dashboard:** open findings by severity across all machines.
-- **Findings → Open findings:** filter by tag (`os`, `library`, `maven`, `os-managed`), severity or product.
+- **Findings → Open findings:** filter by tag (`os`, `library`, `maven`, `os-managed`, `certificate`), severity or product. Tag `certificate` with severity High or Medium lists every certificate that needs renewing, across all Linux and Windows machines.
 - **Products → (machine) → Findings:** everything open on one machine. The **Metrics** tab shows the trend.
 - **Product type → SLA configuration:** fix deadlines per severity, with breach alerts.
 - **Risk acceptance / false positive:** marks a finding so later uploads do not reopen it.

@@ -15,6 +15,8 @@
       * checks the Windows version, SQL Server, .NET, Java, Python, Node.js and
         PowerShell 7 against endoflife.date,
       * lists applications that winget can upgrade (when winget is present),
+      * lists the machine's certificates (Personal, Web Hosting and Remote
+        Desktop stores) and flags expired and soon-expiring ones,
       * uploads the result to DefectDojo: one product per machine, fixed
         findings are closed, new ones are added.
 
@@ -71,6 +73,10 @@ $DefaultConfig = [ordered]@{
     include_runtimes             = $true
     include_winget               = $true
     eol_warning_days             = 90
+    include_certificates         = $true
+    include_valid_certificates   = $true              # also list valid certificates, as Info (inventory)
+    certificate_stores           = @('My', 'WebHosting', 'Remote Desktop')  # under Cert:\LocalMachine
+    cert_warning_days            = 30
     install_updates              = 'none'             # none | security | all
     winget_upgrade               = $false
     reboot_after_updates         = $false
@@ -541,6 +547,90 @@ function ConvertFrom-WingetTable([string[]]$Lines) {
 }
 
 # --------------------------------------------------------------------------
+# certificates
+# --------------------------------------------------------------------------
+
+function Get-StoreCertificates([string]$Store) {
+    $path = "Cert:\LocalMachine\$Store"
+    if (Test-Path -LiteralPath $path) { @(Get-ChildItem -LiteralPath $path) }
+}
+
+function Get-CertificateUses {
+    # thumbprint -> what uses it. netsh is parsed by the shape of the values, not the
+    # labels, because the labels are translated on non-English Windows.
+    $uses = @{}
+    $binding = $null
+    foreach ($line in @(& netsh.exe http show sslcert 2>$null)) {
+        if ("$line" -notmatch '^\s+\S.*?\s+:\s+(\S+)\s*$') {
+            if (-not "$line".Trim()) { $binding = $null }
+            continue
+        }
+        if (-not $binding) { $binding = $Matches[1]; continue }  # the first line of each block
+        if ($Matches[1] -match '^[0-9a-fA-F]{40}$') {
+            $t = $Matches[0].ToUpper()
+            if (-not $uses[$t]) { $uses[$t] = @() }
+            $uses[$t] += "HTTPS $binding"
+        }
+    }
+    try {
+        $rdp = Get-CimInstance -Namespace 'root\cimv2\TerminalServices' -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-Tcp'" -ErrorAction Stop
+        $t = "$($rdp.SSLCertificateSHA1Hash)".ToUpper()
+        if ($t) {
+            if (-not $uses[$t]) { $uses[$t] = @() }
+            $uses[$t] += 'Remote Desktop'
+        }
+    } catch { }
+    $uses
+}
+
+function Get-Certificates($Cfg, [datetime]$Today) {
+    $uses = @{}
+    try { $uses = Get-CertificateUses } catch { Write-Log "  cannot read certificate bindings: $($_.Exception.Message)" }
+    $warn = [int]$Cfg.cert_warning_days
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $found = [ordered]@{}
+    foreach ($store in @($Cfg.certificate_stores)) {
+        foreach ($c in @(Get-StoreCertificates $store)) {
+            if ($c -isnot [Security.Cryptography.X509Certificates.X509Certificate2]) { continue }
+            if ($found.Contains($c.Thumbprint)) { $found[$c.Thumbprint].stores += $store; continue }
+            $name = $c.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if (-not $name) { $name = $c.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::DnsName, $false) }
+            if (-not $name) { $name = $c.Thumbprint }
+            # DnsNameList is added by PowerShell; when it is empty, read the SAN extension
+            $dns = @($c.DnsNameList | ForEach-Object { $_.Unicode } | Where-Object { $_ })
+            if (-not $dns.Count) {
+                $dns = @($c.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } |
+                         ForEach-Object { [regex]::Matches($_.Format($false), 'DNS[^=:,]*[=:]\s*([^,\s]+)') } |
+                         ForEach-Object { $_.Groups[1].Value })
+            }
+            $eku = @($c.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+                     ForEach-Object { $_.EnhancedKeyUsages } | ForEach-Object { if ($_.FriendlyName) { $_.FriendlyName } else { $_.Value } })
+            $days = [int][math]::Truncate(($c.NotAfter - $Today).TotalDays)
+            $found[$c.Thumbprint] = [pscustomobject]@{
+                name            = $name
+                subject         = $c.Subject
+                issuer          = $c.Issuer
+                serial          = $c.SerialNumber
+                thumbprint      = $c.Thumbprint
+                sha256          = -join ($sha.ComputeHash($c.RawData) | ForEach-Object { $_.ToString('x2') })
+                not_before      = $c.NotBefore.ToUniversalTime().ToString('yyyy-MM-dd HH:mm') + ' UTC'
+                not_after       = $c.NotAfter.ToUniversalTime().ToString('yyyy-MM-dd HH:mm') + ' UTC'
+                days_left       = $days
+                status          = $(if ($c.NotAfter -le $Today) { 'expired' } elseif ($days -le $warn) { 'expiring' } else { 'ok' })
+                self_signed     = ($c.Subject -eq $c.Issuer)
+                dns_names       = $dns
+                purposes        = $eku
+                friendly_name   = $c.FriendlyName
+                has_private_key = $c.HasPrivateKey
+                stores          = @($store)
+                used_by         = @($uses[$c.Thumbprint.ToUpper()] | Where-Object { $_ })
+            }
+        }
+    }
+    @($found.Values | Sort-Object not_after, name)
+}
+
+# --------------------------------------------------------------------------
 # findings (DefectDojo "Generic Findings Import")
 # --------------------------------------------------------------------------
 
@@ -637,6 +727,42 @@ function ConvertTo-AppFinding($A) {
         component_name = $A.name; component_version = $A.version
         vuln_id_from_tool = 'app-outdated'; unique_id_from_tool = 'winget|{0}|{1}' -f $A.id, $A.version
         tags = @('vulnagent', 'windows', 'application', 'outdated')
+    }
+}
+
+function ConvertTo-CertFinding($C, [int]$WarnDays) {
+    # the title names the expiry band, so the finding is replaced (old one closed)
+    # when the certificate moves to a more urgent band
+    if ($C.status -eq 'expired') {
+        $title = "Certificate expired: $($C.name)"; $sev = 'High'
+        $mit = "Expired on $($C.not_after) ($(-$C.days_left) days ago). Renew or replace it, or delete it if nothing uses it."
+    } elseif ($C.days_left -le 7) {
+        $title = "Certificate expires within 7 days: $($C.name)"; $sev = 'High'
+        $mit = "Expires on $($C.not_after), in $($C.days_left) days. Renew it now."
+    } elseif ($C.status -eq 'expiring') {
+        $title = "Certificate expires within $WarnDays days: $($C.name)"; $sev = 'Medium'
+        $mit = "Expires on $($C.not_after), in $($C.days_left) days. Renew it before then."
+    } else {
+        $title = "Certificate: $($C.name)"; $sev = 'Info'
+        $mit = "Valid until $($C.not_after) ($($C.days_left) days). Nothing to do yet."
+    }
+    if ($C.used_by -and $C.status -ne 'ok') { $mit += ' After renewing, update the HTTPS binding or Remote Desktop setting that uses it.' }
+    $desc = @("**Subject:** $($C.subject)", ("**Issuer:** $($C.issuer)" + $(if ($C.self_signed) { ' (self-signed)' } else { '' })),
+              "**Serial number:** $($C.serial)", "**Valid from:** $($C.not_before)", "**Valid until:** $($C.not_after)")
+    if ($C.dns_names) { $desc += '**DNS names:** ' + (@($C.dns_names | Select-Object -First 20) -join ', ') }
+    if ($C.purposes) { $desc += '**Purpose:** ' + ($C.purposes -join ', ') }
+    $desc += "**Thumbprint:** $($C.thumbprint)"
+    $desc += '**Store:** ' + (@($C.stores | ForEach-Object { "LocalMachine\$_" }) -join ', ')
+    if ($C.friendly_name) { $desc += "**Friendly name:** $($C.friendly_name)" }
+    $desc += '**Private key:** ' + $(if ($C.has_private_key) { 'yes' } else { 'no' })
+    if ($C.used_by) { $desc += '**Used for:** ' + ($C.used_by -join ', ') }
+    $tags = @('vulnagent', 'windows', 'certificate', $C.status)
+    if ($C.self_signed) { $tags += 'self-signed' }
+    New-Finding @{
+        title = $title; severity = $sev; description = ($desc -join "`n"); mitigation = $mit
+        component_name = $C.name; file_path = "Cert:\LocalMachine\$($C.stores[0])\$($C.thumbprint)"
+        vuln_id_from_tool = 'certificate-' + $C.status; unique_id_from_tool = 'cert|' + $C.thumbprint
+        tags = $tags
     }
 }
 
@@ -831,21 +957,38 @@ function Invoke-Main {
                 Write-Log "  winget: $($apps.Count) applications can be updated"
             } catch { $errs.Add('winget: ' + $_.Exception.Message) }
         }
+
+        $certs = @()
+        if ($cfg.include_certificates) {
+            try {
+                $certs = @(Get-Certificates $cfg $today)
+                foreach ($c in $certs) {
+                    if ($c.status -ne 'ok' -or $cfg.include_valid_certificates) {
+                        $findings.Add((ConvertTo-CertFinding $c ([int]$cfg.cert_warning_days)))
+                    }
+                }
+                Write-Log ('  certificates: {0}, {1} expired, {2} expire within {3} days' -f $certs.Count,
+                    @($certs | Where-Object { $_.status -eq 'expired' }).Count,
+                    @($certs | Where-Object { $_.status -eq 'expiring' }).Count, $cfg.cert_warning_days)
+            } catch { $errs.Add('certificates: ' + $_.Exception.Message) }
+        }
         foreach ($e in $errs) { Write-Log "ERROR $e" }
 
         # 3. report + upload
         $doc = [ordered]@{
             name = 'vulnagent'; type = $SCAN_TYPE; version = $VERSION
-            description = '{0} - {1} {2}.{3}, {4} updates missing ({5} security), {6} programs installed' -f `
-                $hi.host, $hi.os, $hi.version, $hi.ubr, $updates.Count, $secCount, $software.Count
+            description = '{0} - {1} {2}.{3}, {4} updates missing ({5} security), {6} programs installed, {7} certificates' -f `
+                $hi.host, $hi.os, $hi.version, $hi.ubr, $updates.Count, $secCount, $software.Count, $certs.Count
             findings = $findings.ToArray()
         }
         $report = [ordered]@{
             agent = "vulnagent-win $VERSION"; generated = $today.ToString('s'); host = $hi.host; system = $hi
             errors = $errs.ToArray(); patch = $patch; reboot_pending = $reboot; os_support = $osStatus
             missing_updates = @($updates | Select-Object -Property * -ExcludeProperty com)
-            runtimes = $runtimes; outdated_apps = $apps; software = $software
-            summary = [ordered]@{ findings = $findings.Count; updates_missing = $updates.Count; security_updates_missing = $secCount }
+            runtimes = $runtimes; outdated_apps = $apps; certificates = $certs; software = $software
+            summary = [ordered]@{ findings = $findings.Count; updates_missing = $updates.Count; security_updates_missing = $secCount
+                                  certificates = $certs.Count; certificates_expired = @($certs | Where-Object { $_.status -eq 'expired' }).Count
+                                  certificates_expiring = @($certs | Where-Object { $_.status -eq 'expiring' }).Count }
         }
         Write-JsonFile (Join-Path $DataDir 'reports\latest.json') $report
         Write-JsonFile (Join-Path $DataDir 'reports\findings.json') $doc
