@@ -73,7 +73,10 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | Run a scan and upload now | `Start-ScheduledTask vulnagent` |
 | Watch the result | `Get-Content C:\ProgramData\vulnagent\vulnagent.log -Tail 30` |
 | Last run result | `Get-ScheduledTaskInfo vulnagent` (LastTaskResult 0 = OK, 2 = uploaded but part of the scan failed, 3 = failed) |
-| Scan without uploading | `& 'C:\Program Files\vulnagent\vulnagent-win.ps1' -DryRun -Output C:\Temp\findings.json` |
+| Scan and upload, in this window | `powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-win.ps1"` |
+| Install missing security updates now, then scan and upload | `powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-win.ps1" -InstallUpdates security` |
+| Scan and upload, skip the patching set in the config | `... vulnagent-win.ps1 -NoPatch` |
+| Scan without uploading | `... vulnagent-win.ps1 -DryRun -Output C:\Temp\findings.json` |
 | Full local report | `C:\ProgramData\vulnagent\reports\latest.json` (includes the list of installed programs) |
 
 ## Configuration (`C:\ProgramData\vulnagent\defectdojo.json`)
@@ -95,7 +98,19 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | `minimum_severity` | `Info` | Don't import findings below this. |
 | `verify_tls` | `true` | `false` accepts any certificate (same as `-Insecure`). |
 
-## Automatic patching
+## Patching
+
+### Now, by hand
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-win.ps1" -InstallUpdates security
+```
+
+This installs the missing security updates (`-InstallUpdates all` installs every update), then scans and uploads, so DefectDojo shows what is still missing. **It never restarts the server**, even if `reboot_after_updates` is on in the config. When a restart is needed, the output says `RESTART NEEDED`, and a "Restart pending" finding stays open until you restart.
+
+Run it in a local administrator PowerShell, or through Remote Desktop. Windows doesn't allow installing updates from a remote PowerShell session (`Invoke-Command`, `Enter-PSSession`); that fails with `0x80070005`.
+
+### Every night
 
 Off by default. To turn it on for a server, set `"install_updates": "security"` in its config (and optionally `"reboot_after_updates": true`). The nightly run then installs the missing security updates, scans, and reports what is still missing.
 

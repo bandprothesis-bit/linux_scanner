@@ -31,6 +31,11 @@
 .EXAMPLE
     vulnagent-win.ps1 -DryRun -Output C:\Temp\findings.json
     Scan only and write the findings that would be uploaded.
+
+.EXAMPLE
+    vulnagent-win.ps1 -InstallUpdates security
+    Install the missing security updates now, then scan and upload. Never
+    restarts the machine: the log says when a restart is needed.
 #>
 [CmdletBinding()]
 param(
@@ -40,7 +45,8 @@ param(
     [switch]$Insecure,
     [switch]$DryRun,
     [string]$Output,
-    [switch]$NoPatch
+    [switch]$NoPatch,
+    [ValidateSet('none', 'security', 'all')][string]$InstallUpdates
 )
 
 $ErrorActionPreference = 'Stop'
@@ -744,15 +750,21 @@ function Invoke-Main {
         if ($Url) { $cfg.url = $Url }
         if ($Token) { $cfg.api_token = $Token }
         if ($Insecure) { $cfg.verify_tls = $false }
+        if ($InstallUpdates) {
+            # a run started by hand patches as asked and never restarts on its own
+            $cfg.install_updates = $InstallUpdates
+            $cfg.reboot_after_updates = $false
+            if ($DryRun) { Write-Log '-DryRun: not installing updates' }
+        }
         $today = Get-Date
         $errs = New-Object Collections.Generic.List[string]
         $hi = Get-HostInfo
         Write-Log "vulnagent-win $VERSION on $($hi.host): $($hi.os) $($hi.version).$($hi.ubr)"
 
-        # 1. patching (off unless enabled in the config)
+        # 1. patching (off unless enabled in the config or with -InstallUpdates)
         $patch = $null
         $patchMode = "$($cfg.install_updates)".ToLower()
-        if (-not $DryRun -and -not $NoPatch -and ($patchMode -eq 'security' -or $patchMode -eq 'all')) {
+        if (-not $DryRun -and (-not $NoPatch -or $InstallUpdates) -and ($patchMode -eq 'security' -or $patchMode -eq 'all')) {
             try { $patch = Install-WindowsUpdates $cfg } catch { $errs.Add('patch: ' + (Get-WUErrorText $_)) }
         }
         $winget = if ($cfg.include_winget -or $cfg.winget_upgrade) { Find-Winget } else { $null }
@@ -850,6 +862,8 @@ function Invoke-Main {
         if ($patch -and $patch.reboot_required -and $cfg.reboot_after_updates) {
             Write-Log 'restarting in 10 minutes to finish installing updates'
             & shutdown.exe /r /t 600 /d p:2:17 /c 'vulnagent: restarting to finish installing Windows updates' | Out-Null
+        } elseif ($patch -and $patch.reboot_required) {
+            Write-Log 'RESTART NEEDED to finish installing the updates (not restarting automatically)'
         }
         if ($errs.Count) { return 2 }
         return 0
