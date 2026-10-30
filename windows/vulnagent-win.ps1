@@ -18,7 +18,9 @@
       * lists the machine's certificates (Personal, Web Hosting and Remote
         Desktop stores) and flags expired and soon-expiring ones,
       * uploads the result to DefectDojo: one product per machine, fixed
-        findings are closed, new ones are added.
+        findings are closed, new ones are added,
+      * writes an HTML report of all findings to
+        C:\ProgramData\vulnagent\reports\latest.html (and to -Html).
 
     Needs only Windows PowerShell 5.1 (built into Windows Server 2016 and
     later; install WMF 5.1 on 2012 R2).
@@ -35,6 +37,11 @@
     Scan only and write the findings that would be uploaded.
 
 .EXAMPLE
+    vulnagent-win.ps1 -DryRun -Html $env:TEMP\vulnagent.html
+    Scan only, without uploading, and write the HTML report where your
+    browser can open it.
+
+.EXAMPLE
     vulnagent-win.ps1 -InstallUpdates security
     Install the missing security updates now, then scan and upload. Never
     restarts the machine: the log says when a restart is needed.
@@ -47,6 +54,7 @@ param(
     [switch]$Insecure,
     [switch]$DryRun,
     [string]$Output,
+    [string]$Html,
     [switch]$NoPatch,
     [ValidateSet('none', 'security', 'all')][string]$InstallUpdates
 )
@@ -142,9 +150,12 @@ function Write-Log([string]$Message) {
     } catch { }
 }
 
+function Write-TextFile([string]$Path, [string]$Text) {
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
+}
+
 function Write-JsonFile([string]$Path, $Object) {
-    $json = ConvertTo-Json -InputObject $Object -Depth 8
-    [IO.File]::WriteAllText($Path, $json, (New-Object Text.UTF8Encoding $false))
+    Write-TextFile $Path (ConvertTo-Json -InputObject $Object -Depth 8)
 }
 
 function Get-Clip([string]$Text, [int]$Max) {
@@ -767,6 +778,212 @@ function ConvertTo-CertFinding($C, [int]$WarnDays) {
 }
 
 # --------------------------------------------------------------------------
+# HTML report
+# --------------------------------------------------------------------------
+
+$SeverityOrder = [ordered]@{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
+$FindingKinds = [ordered]@{
+    'windows-update' = 'Windows Update'; certificate = 'Certificate'; runtime = 'Runtime'
+    application = 'Application'; eol = 'Windows support'; reboot = 'Restart'
+}
+
+function Format-Html($Text) { [Net.WebUtility]::HtmlEncode("$Text") }
+
+function Get-FindingKind($Tags) {
+    foreach ($k in $FindingKinds.Keys) { if (@($Tags) -contains $k) { return $FindingKinds[$k] } }
+    'Other'
+}
+
+function ConvertFrom-FindingText([string]$Text) {
+    # descriptions are "**Label:** value" lines
+    @(foreach ($l in ($Text -split "`n")) { [regex]::Replace((Format-Html $l), '\*\*(.+?)\*\*', '<b>$1</b>') }) -join '<br>'
+}
+
+function Get-SevBadge([string]$Severity) {
+    '<span class="sev s-' + $Severity.ToLower() + '">' + (Format-Html $Severity) + '</span>'
+}
+
+function New-HtmlTable([string[]]$Headers, $Rows, [string]$Empty) {
+    if (-not $Rows -or $Rows.Count -eq 0) { return '<p class="none">' + $Empty + '</p>' }
+    $head = ($Headers | ForEach-Object { '<th>' + $_ + '</th>' }) -join ''
+    $body = ($Rows | ForEach-Object { '<tr>' + (($_ | ForEach-Object { '<td>' + $_ + '</td>' }) -join '') + '</tr>' }) -join "`n"
+    '<div class="wrap"><table><thead><tr>' + $head + '</tr></thead><tbody>' + $body + '</tbody></table></div>'
+}
+
+$HtmlStyle = @'
+body{font:14px/1.45 "Segoe UI",system-ui,sans-serif;background:#fff;color:#1d1d1f;margin:0 auto;padding:24px 16px;max-width:1300px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 8px}h2 small{font-weight:400;color:#666}
+.mut,th,.kind,.none{color:#666}.none{font-style:italic}
+.cards{display:flex;flex-wrap:wrap;margin:18px -5px 6px}
+.card{background:#f4f4f6;border:2px solid transparent;border-radius:8px;padding:8px 16px;margin:5px;min-width:96px;text-align:left;font:inherit;color:inherit}
+button.card{cursor:pointer}button.card.on{border-color:#1d1d1f}
+.n{display:block;font-size:24px;font-weight:700;line-height:1.2}
+.c-critical,.bad{color:#b00020}.c-high,.soon{color:#e65100}.c-medium{color:#b7791f}.c-low{color:#0277bd}.c-info{color:#777}.good{color:#2e7d32}.bad{font-weight:700}
+.sev{display:inline-block;color:#fff;border-radius:4px;padding:1px 7px;font-size:11px;font-weight:700;min-width:54px;text-align:center}
+.s-critical{background:#b00020}.s-high{background:#e65100}.s-medium{background:#f9a825;color:#1d1d1f}.s-low{background:#0277bd}.s-info{background:#888}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid #e3e3e3;padding:6px 8px;text-align:left;vertical-align:top}th{font-weight:600;white-space:nowrap}
+.wrap{overflow-x:auto}summary{cursor:pointer}
+.desc{margin:6px 0 2px;padding:8px 10px;background:#f4f4f6;border-radius:6px;word-wrap:break-word}
+.kind{white-space:nowrap}.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+.bar{display:flex;flex-wrap:wrap;align-items:center;margin:8px 0}.bar>*{margin:0 10px 6px 0}
+#q{width:320px;max-width:100%;padding:6px 10px;border:1px solid #bbb;border-radius:6px;font:inherit;background:inherit;color:inherit}
+#all{padding:6px 10px;border:1px solid #bbb;border-radius:6px;background:inherit;color:inherit;font:inherit;cursor:pointer}
+.warn{border-left:4px solid #e65100;background:#fff4e5;padding:8px 12px;margin:14px 0;border-radius:4px}
+a{color:inherit}ul{margin:4px 0;padding-left:20px}
+@media (prefers-color-scheme:dark){body{background:#141416;color:#ececec}.mut,th,.kind,.none,h2 small{color:#9a9a9a}
+.card,.desc{background:#1e1e22}th,td{border-color:#2c2c30}button.card.on{border-color:#ececec}.warn{background:#2a2015}
+.c-critical,.bad{color:#ff6b6b}.c-high,.soon{color:#ff9e40}.c-medium{color:#f9c74f}.c-low{color:#4fc3f7}.good{color:#81c784}}
+@media print{.bar,#all{display:none}body{max-width:none}}
+'@
+
+$HtmlScript = @'
+(function () {
+  var q = document.getElementById('q'), on = {}, rows = document.querySelectorAll('#findings tbody tr');
+  function each(list, fn) { for (var i = 0; i < list.length; i++) fn(list[i]); }
+  function apply() {
+    var t = q.value.toLowerCase(), any = false, n = 0, k;
+    for (k in on) { if (on[k]) any = true; }
+    each(rows, function (r) {
+      var ok = (!any || on[r.getAttribute('data-sev')]) && (!t || r.textContent.toLowerCase().indexOf(t) >= 0);
+      r.style.display = ok ? '' : 'none';
+      if (ok) n++;
+    });
+    document.getElementById('shown').innerHTML = n;
+  }
+  each(document.querySelectorAll('button.card'), function (c) {
+    c.onclick = function () {
+      var s = c.getAttribute('data-sev');
+      on[s] = !on[s];
+      c.className = on[s] ? 'card on' : 'card';
+      apply();
+    };
+  });
+  q.oninput = apply; q.onkeyup = apply;
+  document.getElementById('all').onclick = function () {
+    var d = document.querySelectorAll('#findings details'), o = !(d.length && d[0].open);
+    each(d, function (x) { x.open = o; });
+  };
+  window.onbeforeprint = function () { each(document.querySelectorAll('details'), function (x) { x.open = true; }); };
+})();
+'@
+
+function ConvertTo-HtmlReport($Report, $Doc) {
+    $hi = $Report.system
+    $all = @($Doc.findings | Sort-Object { $SeverityOrder[$_.severity] }, { $_.title })
+    $out = New-Object Collections.Generic.List[string]
+    $out.Add('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="X-UA-Compatible" content="IE=edge">')
+    $out.Add('<meta name="viewport" content="width=device-width,initial-scale=1"><title>vulnagent - ' + (Format-Html $hi.host) + '</title>')
+    $out.Add('<style>' + $HtmlStyle + '</style></head><body>')
+    $out.Add('<h1>Security report &ndash; ' + (Format-Html $hi.host) + '</h1>')
+    $meta = @(("$($hi.os) $($hi.version).$($hi.ubr)" + $(if ($hi.release) { " ($($hi.release))" } else { '' })),
+              "generated $(([string]$Report.generated).Replace('T', ' '))")
+    if ($hi.last_boot) { $meta += "last restart $(([string]$hi.last_boot).Replace('T', ' '))" }
+    $meta += $Report.agent
+    if ($DryRun) { $meta += 'dry run: not sent to DefectDojo' }
+    $out.Add('<div class="mut">' + (($meta | ForEach-Object { Format-Html $_ }) -join ' &middot; ') + '</div>')
+
+    if ($Report.errors) {
+        $out.Add('<div class="warn"><b>Part of the scan failed</b>, so this report may be incomplete:<ul>' +
+                 (($Report.errors | ForEach-Object { '<li>' + (Format-Html $_) + '</li>' }) -join '') + '</ul></div>')
+    }
+    if ($Report.reboot_pending) { $out.Add('<div class="warn"><b>Restart pending:</b> installed updates are not active until Windows restarts.</div>') }
+
+    # summary cards: the severity cards filter the findings table
+    $out.Add('<div class="cards">')
+    foreach ($s in $SeverityOrder.Keys) {
+        $n = @($all | Where-Object { $_.severity -eq $s }).Count
+        $out.Add('<button class="card" data-sev="' + $s + '" title="Show only ' + $s + '"><span class="n c-' + $s.ToLower() + '">' + $n + '</span>' + $s + '</button>')
+    }
+    $sum = $Report.summary
+    $out.Add('<div class="card"><span class="n">' + $sum.updates_missing + '</span>missing updates (' + $sum.security_updates_missing + ' security)</div>')
+    if ($null -ne $sum.certificates) {
+        $out.Add('<div class="card"><span class="n">' + $sum.certificates + '</span>certificates (' + $sum.certificates_expired + ' expired, ' + $sum.certificates_expiring + ' expiring)</div>')
+    }
+    $os = $Report.os_support
+    if ($os) {
+        $cls = if ($os.eol) { 'bad' } elseif ($os.days_left -le 180) { 'soon' } else { 'good' }
+        $txt = if ($os.eol) { 'out of support' } else { 'supported' }
+        $out.Add('<div class="card"><span class="n ' + $cls + '">' + $txt + '</span>' + (Format-Html $os.label) + ' until ' + (Format-Html $os.eol_date) + '</div>')
+    }
+    $out.Add('</div>')
+
+    # findings
+    $out.Add('<h2 id="findings-title">Findings <small>(<span id="shown">' + $all.Count + '</span> of ' + $all.Count + ' shown)</small></h2>')
+    $out.Add('<div class="bar"><input id="q" type="search" placeholder="Search findings, KBs, CVEs, names..."><button id="all" type="button">Expand / collapse all</button></div>')
+    $rows = foreach ($x in $all) {
+        $det = ConvertFrom-FindingText $x.description
+        if ($x.component_version) { $det += '<br><b>Version:</b> ' + (Format-Html $x.component_version) }
+        $links = @("$($x.references)" -split "`n" | Where-Object { $_ -match '^https?://' })
+        if ($links) { $det += '<br><b>More:</b> ' + (($links | ForEach-Object { '<a href="' + (Format-Html $_) + '">' + (Format-Html $_) + '</a>' }) -join ' ') }
+        '<tr data-sev="' + $x.severity + '"><td>' + (Get-SevBadge $x.severity) + '</td><td><details><summary>' + (Format-Html $x.title) +
+            '</summary><div class="desc">' + $det + '</div></details></td><td class="kind">' + (Get-FindingKind $x.tags) + '</td><td>' + (Format-Html $x.mitigation) + '</td></tr>'
+    }
+    if ($all.Count) {
+        $out.Add('<div class="wrap"><table id="findings"><thead><tr><th>Severity</th><th>Finding (click for details)</th><th>Type</th><th>What to do</th></tr></thead><tbody>')
+        $out.Add(($rows -join "`n"))
+        $out.Add('</tbody></table></div>')
+    } else {
+        $out.Add('<table id="findings"><tbody></tbody></table><p class="none">Nothing found.</p>')
+    }
+
+    # details per area
+    $rows = New-Object Collections.Generic.List[object]
+    foreach ($u in @($Report.missing_updates)) {
+        $rows.Add(@((Format-Html (@($u.kb) -join ', ')), (Format-Html $u.title), (Format-Html $u.classification),
+                    $(if ($u.msrc_severity) { Format-Html $u.msrc_severity } elseif ($u.security) { 'not rated' } else { '-' }),
+                    (Format-Html $u.published)))
+    }
+    $out.Add('<h2>Missing Windows updates <small>(' + $rows.Count + ')</small></h2>')
+    $out.Add((New-HtmlTable @('KB', 'Update', 'Classification', 'Microsoft severity', 'Released') $rows 'No missing updates.'))
+
+    $rows = New-Object Collections.Generic.List[object]
+    foreach ($r in @($Report.runtimes)) {
+        $cls = @{ eol = 'bad'; outdated = 'soon'; ok = 'good' }[$r.status]
+        $label = @{ eol = 'end-of-life'; outdated = 'outdated'; ok = 'up to date' }[$r.status]
+        if (-not $label) { $label = "$($r.status)" }
+        $rows.Add(@((Format-Html $r.name), (Format-Html $r.version), ('<span class="' + $cls + '">' + $label + '</span>'),
+                    (Format-Html $r.latest), (Format-Html $r.eol_date), ('<span class="mono">' + (Format-Html $r.path) + '</span>')))
+    }
+    $out.Add('<h2>Runtimes and SQL Server <small>(' + $rows.Count + ')</small></h2>')
+    $out.Add((New-HtmlTable @('Software', 'Version', 'Status', 'Latest', 'End of support', 'Path') $rows 'None found, or the check is turned off.'))
+
+    $rows = New-Object Collections.Generic.List[object]
+    foreach ($a in @($Report.outdated_apps)) {
+        $rows.Add(@((Format-Html $a.name), (Format-Html $a.version), (Format-Html $a.available), ('<span class="mono">' + (Format-Html $a.id) + '</span>')))
+    }
+    $out.Add('<h2>Applications with updates <small>(' + $rows.Count + ')</small></h2>')
+    $out.Add((New-HtmlTable @('Application', 'Installed', 'Available', 'winget ID') $rows 'None, or winget is not installed.'))
+
+    $rows = New-Object Collections.Generic.List[object]
+    foreach ($c in @($Report.certificates)) {
+        $left = if ($c.status -eq 'expired') { '<span class="bad">expired</span>' }
+                elseif ($c.status -eq 'expiring') { '<span class="soon">' + $c.days_left + ' days</span>' }
+                else { '<span class="good">' + $c.days_left + ' days</span>' }
+        $rows.Add(@($left, (Format-Html $c.name), (Format-Html $c.not_after), (Format-Html $c.issuer),
+                    (Format-Html (@($c.stores) -join ', ')), (Format-Html (@($c.used_by) -join ', ')),
+                    ('<span class="mono">' + (Format-Html $c.thumbprint) + '</span>')))
+    }
+    $out.Add('<h2>Certificates <small>(' + $rows.Count + ')</small></h2>')
+    $out.Add((New-HtmlTable @('Expires in', 'Name', 'Valid until', 'Issuer', 'Store', 'Used for', 'Thumbprint') $rows 'None found, or the check is turned off.'))
+
+    $p = $Report.patch
+    if ($p) {
+        $out.Add('<h2>Updates installed in this run</h2>')
+        foreach ($part in @(@('Installed', $p.installed), @('Failed', $p.failed), @('Skipped', $p.skipped))) {
+            if (@($part[1]).Count) {
+                $out.Add('<p><b>' + $part[0] + ':</b></p><ul>' + ((@($part[1]) | ForEach-Object { '<li>' + (Format-Html $_) + '</li>' }) -join '') + '</ul>')
+            }
+        }
+        if ($p.reboot_required) { $out.Add('<p class="soon"><b>A restart is needed to finish installing them.</b></p>') }
+    }
+
+    $out.Add('<p class="mut" style="margin-top:32px">' + @($Report.software).Count + ' programs installed. Full data: C:\ProgramData\vulnagent\reports\latest.json</p>')
+    $out.Add('<script>' + $HtmlScript + '</script></body></html>')
+    $out -join "`n"
+}
+
+# --------------------------------------------------------------------------
 # upload
 # --------------------------------------------------------------------------
 
@@ -993,6 +1210,15 @@ function Invoke-Main {
         Write-JsonFile (Join-Path $DataDir 'reports\latest.json') $report
         Write-JsonFile (Join-Path $DataDir 'reports\findings.json') $doc
         if ($Output) { Write-JsonFile $Output $doc; Write-Log "wrote $Output" }
+        try {
+            $page = ConvertTo-HtmlReport $report $doc
+            Write-TextFile (Join-Path $DataDir 'reports\latest.html') $page
+            if ($Html) {
+                $Html = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Html)
+                Write-TextFile $Html $page
+                Write-Log "HTML report: $Html"
+            }
+        } catch { Write-Log "ERROR HTML report: $($_.Exception.Message)" }
         $bySev = foreach ($s in 'Critical', 'High', 'Medium', 'Low', 'Info') {
             $n = @($findings | Where-Object { $_.severity -eq $s }).Count
             if ($n) { "$s $n" }

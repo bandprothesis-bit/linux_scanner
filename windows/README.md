@@ -13,6 +13,8 @@ Every night, as a scheduled task running as SYSTEM, it does this:
 | **Restart pending** after updates | Registry | Low |
 | **Certificates** in the computer's Personal, Web Hosting and Remote Desktop stores | Certificate store, plus the IIS/HTTP.sys bindings and the Remote Desktop certificate setting to show where each one is used | High when expired or expiring within 7 days. Medium within 30 days. Every other certificate is listed as Info, as an inventory. |
 
+Each run also writes a readable **HTML report** of everything it found: see [HTML report](#html-report).
+
 Each machine becomes its own DefectDojo product under the product type **Windows servers**. Fixed findings close automatically, new ones are added, and notes and risk acceptances are kept, the same as on Linux.
 
 Defender antivirus signature updates are ignored. Non-security updates are left out unless you turn on `include_non_security_updates`.
@@ -78,7 +80,25 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | Install missing security updates now, then scan and upload | `powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-win.ps1" -InstallUpdates security` |
 | Scan and upload, skip the patching set in the config | `... vulnagent-win.ps1 -NoPatch` |
 | Scan without uploading | `... vulnagent-win.ps1 -DryRun -Output C:\Temp\findings.json` |
+| Scan without uploading, and open the HTML report | `... vulnagent-win.ps1 -DryRun -Html $env:TEMP\vulnagent.html; start $env:TEMP\vulnagent.html` |
+| HTML report of the last nightly run | `Copy-Item C:\ProgramData\vulnagent\reports\latest.html $env:TEMP; start $env:TEMP\latest.html` |
 | Full local report | `C:\ProgramData\vulnagent\reports\latest.json` (includes the list of installed programs) |
+
+## HTML report
+
+Every run, including `-DryRun`, writes `C:\ProgramData\vulnagent\reports\latest.html`. It is one file with no external links, so it opens on servers without internet access, and it can be attached to an email or a ticket.
+
+It contains:
+
+- The machine, Windows version, last restart and when the scan ran, plus warnings when part of the scan failed or a restart is pending.
+- Counts by severity, missing updates, certificates and Windows support status. Click a severity count to show only those findings.
+- All findings, sorted by severity, with a search box (KB, CVE, name, thumbprint...). Click a finding to see its details: KB, CVEs, path, store, what uses it.
+- Tables of the missing Windows updates, runtimes and SQL Server, applications with updates, and certificates.
+- The updates installed in this run, when patching is on.
+
+Printing it (or *Print → Save as PDF*) expands every finding.
+
+The `C:\ProgramData\vulnagent` folder is readable only by administrators, so a browser can't open the file there directly. Copy it out first (see [Daily operation](#daily-operation)), or write it somewhere else with `-Html <path>` when you run the scan by hand.
 
 ## Configuration (`C:\ProgramData\vulnagent\defectdojo.json`)
 
