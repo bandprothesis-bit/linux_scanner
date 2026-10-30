@@ -1,0 +1,15 @@
+[Unit]
+Description=Import Microsoft Defender vulnerabilities into DefectDojo
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/defender-dojo -c /etc/vulnagent/defender.json
+# exit 1 = at least one customer or device failed (details in the journal)
+Nice=10
+TimeoutStartSec=3h
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true

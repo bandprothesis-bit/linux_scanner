@@ -21,6 +21,10 @@ What gets uploaded from each machine:
 
 Reporting is one-way. Patching is still controlled by each machine's `/etc/vulnagent/config.json`.
 
+**Windows servers** report to the same DefectDojo with a PowerShell agent. See [windows/README.md](../windows/README.md).
+
+Customers with **Microsoft Defender for Endpoint** can feed the same DefectDojo without installing anything on their devices. See [DEFENDER.md](DEFENDER.md).
+
 ## 1. DefectDojo server (one VM)
 
 **Recommended VM:** Ubuntu Server 24.04 LTS (Debian 12/13 also works), 4 vCPU, 8 GB RAM, 50 GB disk. Give it a fixed IP address or a DNS name that the machines can reach.
