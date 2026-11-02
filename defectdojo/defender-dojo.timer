@@ -1,0 +1,11 @@
+[Unit]
+Description=Import Microsoft Defender vulnerabilities into DefectDojo daily
+
+[Timer]
+# after the Linux agents' 03:30-04:15 uploads
+OnCalendar=*-*-* 05:15:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

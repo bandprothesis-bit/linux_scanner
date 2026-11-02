@@ -1,0 +1,36 @@
+{
+  "_comment": "Microsoft Defender -> DefectDojo. Copy to /etc/vulnagent/defender.json with mode 0600 (it holds secrets). Keys starting with _ are ignored.",
+
+  "defectdojo": {
+    "url": "http://127.0.0.1:8080",
+    "_api_token": "DefectDojo user menu -> API v2 Key. Can also come from env DD_API_TOKEN.",
+    "api_token": "",
+    "verify_tls": true,
+    "ca_file": ""
+  },
+
+  "_client_id": "Optional: one multi-tenant app registration shared by all customers (partner access). Leave empty if every customer has its own app.",
+  "client_id": "",
+  "client_secret": "",
+
+  "_product_name": "DefectDojo product per device. {host} = device DNS name, {short} = short name, {customer} = customer name. Product names must be unique in DefectDojo, so keep {customer} in it.",
+  "product_name": "{host} ({customer})",
+  "_skip_inactive_days": "Devices Defender has not seen for this many days are not uploaded (0 = upload all)",
+  "skip_inactive_days": 30,
+  "minimum_severity": "Info",
+  "upload_workers": 4,
+
+  "customers": [
+    {
+      "name": "Contoso",
+      "_tenant_id": "Customer's Microsoft Entra tenant (Directory) ID",
+      "tenant_id": "00000000-0000-0000-0000-000000000000",
+      "_client_id": "The customer's app registration (Application/client ID) and secret value. 'env:NAME' reads the secret from an environment variable.",
+      "client_id": "00000000-0000-0000-0000-000000000000",
+      "client_secret": "",
+      "_product_type": "DefectDojo product type for this customer's devices (defaults to the name)",
+      "product_type": "Contoso",
+      "enabled": true
+    }
+  ]
+}

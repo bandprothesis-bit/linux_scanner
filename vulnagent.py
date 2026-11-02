@@ -4,9 +4,10 @@ vulnagent - Linux vulnerability inventory & auto-patching agent.
 
 What it does on every run:
   1. Inventory  - OS packages (dpkg/rpm/apk/pacman), language runtimes
-                  (PHP, Java, Python, Node.js, Ruby, Go) and application
+                  (PHP, Java, Python, Node.js, Ruby, Go), application
                   libraries found on disk (PyPI, npm, Composer/Packagist,
-                  RubyGems, Maven JAR/WAR/EAR incl. nested/fat jars).
+                  RubyGems, Maven JAR/WAR/EAR incl. nested/fat jars) and
+                  installed X.509 certificates (expired / expiring soon).
   2. Assess     - matches everything against OSV.dev (CVE/GHSA/DSA/USN...),
                   checks runtimes against endoflife.date (EOL / missing
                   patch releases) and asks the package manager which
@@ -29,6 +30,7 @@ import datetime
 import fcntl
 import glob
 import gzip
+import hashlib
 import html
 import io
 import json
@@ -39,8 +41,10 @@ import pwd
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -72,6 +76,14 @@ DEFAULT_CONFIG = {
                       "/usr/share/locale", "/usr/share/icons"],
     "max_scan_depth": 14,
     "same_filesystem": True,
+    "scan_certificates": True,
+    "cert_paths": ["/etc/letsencrypt/live", "/usr/local/share/ca-certificates",
+                   "/etc/pki/ca-trust/source/anchors", "/etc/ssl", "/etc/pki", "/etc/nginx",
+                   "/etc/apache2", "/etc/httpd", "/etc/haproxy", "/etc/postfix", "/etc/dovecot",
+                   "/etc/mysql", "/etc/postgresql", "/etc/openvpn", "/etc/docker",
+                   "/etc/kubernetes/pki", "/var/lib/kubelet/pki", "/etc/grafana",
+                   "/usr/local/etc", "/opt", "/srv"],
+    "cert_warning_days": 30,
     "max_archive_mb": 300,
     "refresh_package_index": True,
     # OSV ecosystem used for OS packages. Auto-detected for Debian, Ubuntu and
@@ -733,6 +745,143 @@ def eol_status(spec, ver, eol):
 
 
 # --------------------------------------------------------------------------
+# certificates
+# --------------------------------------------------------------------------
+
+CERT_EXTS = (".pem", ".crt", ".cer", ".cert", ".der")
+# the distribution's own CA bundle: kept current by its package, not by the admin
+TRUST_STORE_DIRS = ("/usr/share/ca-certificates/", "/etc/pki/ca-trust/extracted/", "/usr/share/pki/",
+                    "/var/lib/ca-certificates/", "/etc/ssl/certs/java/")
+CERT_SKIP_DIRS = SKIP_DIR_NAMES | {"node_modules", "site-packages", "dist-packages", "vendor",
+                                   "test", "tests", "testdata", "fixtures"}
+CERT_BUNDLE_MAX = 20  # a file with more certificates is a CA bundle (e.g. certifi's cacert.pem)
+# server configs searched for the certificate files they use
+CERT_CONFIGS = ["/etc/nginx/**/*.conf", "/etc/nginx/sites-enabled/*", "/etc/apache2/sites-enabled/*",
+                "/etc/apache2/mods-enabled/ssl.conf", "/etc/httpd/conf/*.conf", "/etc/httpd/conf.d/*.conf",
+                "/etc/haproxy/haproxy.cfg", "/etc/lighttpd/**/*.conf", "/etc/postfix/main.cf",
+                "/etc/dovecot/**/*.conf", "/etc/mysql/**/*.cnf", "/etc/my.cnf.d/*.cnf",
+                "/etc/postgresql/*/main/postgresql.conf", "/var/lib/pgsql/data/postgresql.conf",
+                "/etc/openvpn/**/*.conf", "/etc/grafana/grafana.ini", "/etc/vsftpd.conf",
+                "/etc/vsftpd/vsftpd.conf", "/etc/stunnel/*.conf", "/etc/docker/daemon.json",
+                "/etc/gitlab/gitlab.rb"]
+CERT_ATTRS = {"commonName": "CN", "organizationName": "O", "organizationalUnitName": "OU", "countryName": "C",
+              "localityName": "L", "stateOrProvinceName": "ST", "emailAddress": "E", "domainComponent": "DC"}
+PEM_RE = re.compile(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----")
+CONF_CERT_RE = re.compile(r"(/[\w./@+-]+\.(?:pem|crt|cer|cert))\b")
+
+
+def decode_cert(pem):
+    """Subject, issuer, serial, validity and DNS names of one PEM certificate."""
+    fd, tmp = tempfile.mkstemp(suffix=".pem")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        decoder = getattr(ssl._ssl, "_test_decode_cert", None)  # CPython's own parser: no openssl binary needed
+        if decoder:
+            d = decoder(tmp)
+            name = lambda rdns: ", ".join("%s=%s" % (CERT_ATTRS.get(k, k), v) for rdn in rdns for k, v in rdn)
+            return {"subject": name(d.get("subject", ())), "issuer": name(d.get("issuer", ())),
+                    "serial": d.get("serialNumber", ""), "not_before": d["notBefore"], "not_after": d["notAfter"],
+                    "dns_names": [v for k, v in d.get("subjectAltName", ()) if k in ("DNS", "IP Address")]}
+        rc, out, err = run(["openssl", "x509", "-in", tmp, "-noout", "-nameopt", "RFC2253", "-subject", "-issuer",
+                            "-serial", "-startdate", "-enddate", "-ext", "subjectAltName"], timeout=30)
+        if rc != 0:
+            raise ValueError(err.strip() or "openssl failed")
+        f = dict(l.split("=", 1) for l in out.splitlines()
+                 if re.match(r"^(subject|issuer|serial|notBefore|notAfter)=", l))
+        return {"subject": f.get("subject", "").strip(), "issuer": f.get("issuer", "").strip(),
+                "serial": f.get("serial", ""), "not_before": f["notBefore"], "not_after": f["notAfter"],
+                "dns_names": re.findall(r"(?:DNS|IP Address):([^,\s]+)", out)}
+    finally:
+        os.remove(tmp)
+
+
+def config_cert_refs():
+    """Certificate files named in web, mail and database server configs -> the configs naming them."""
+    refs = {}
+    for g in CERT_CONFIGS:
+        for conf in glob.glob(g, recursive=True):
+            try:
+                with open(conf, encoding="utf-8", errors="replace") as f:
+                    lines = f.read(1024 * 1024).splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if not line.lstrip().startswith(("#", ";")):
+                    for p in CONF_CERT_RE.findall(line):
+                        refs.setdefault(p, set()).add(conf)
+    return refs
+
+
+def inventory_certificates(cfg):
+    excludes = tuple(os.path.normpath(p) + "/" for p in cfg["exclude_paths"])
+    refs = config_cert_refs()
+    refs_real = {}
+    for p, confs in refs.items():
+        refs_real.setdefault(os.path.realpath(p), set()).update(confs)
+    files = sorted(refs)
+    for root in cfg["cert_paths"]:
+        root = os.path.normpath(root)
+        for dirpath, dirs, names in os.walk(root):
+            if dirpath.count("/") - root.count("/") >= 8:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if d not in CERT_SKIP_DIRS
+                       and not (os.path.join(dirpath, d) + "/").startswith(excludes)]
+            files += [os.path.join(dirpath, n) for n in sorted(names) if n.lower().endswith(CERT_EXTS)]
+
+    now = time.time()
+    warn = int(cfg["cert_warning_days"])
+    utc = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    certs, seen = {}, set()
+    for path in files:
+        real = os.path.realpath(path)
+        if real in seen or real.startswith(TRUST_STORE_DIRS) or not os.path.isfile(real):
+            continue
+        seen.add(real)
+        try:
+            if os.path.getsize(real) > 1024 * 1024:
+                continue
+            with open(real, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        pems = PEM_RE.findall(data.decode("latin-1"))
+        if not pems and data[:1] == b"\x30" and real.lower().endswith((".der", ".cer", ".crt")):
+            pems = [ssl.DER_cert_to_PEM_cert(data)]
+        if len(pems) > CERT_BUNDLE_MAX:
+            log.debug("skipping CA bundle %s (%d certificates)", path, len(pems))
+            continue
+        for pem in pems:
+            try:
+                der = ssl.PEM_cert_to_DER_cert(pem)
+                sha256 = hashlib.sha256(der).hexdigest()
+                if sha256 not in certs:
+                    d = decode_cert(pem)
+                    end = ssl.cert_time_to_seconds(d["not_after"])
+                    days = int((end - now) / 86400)  # whole days, toward zero
+                    cn = re.search(r"(?:^|,\s*)CN=([^,]+)", d["subject"])
+                    certs[sha256] = {
+                        "name": cn.group(1).strip() if cn else (d["dns_names"] or [d["subject"] or "(no subject)"])[0],
+                        "subject": d["subject"], "issuer": d["issuer"], "serial": d["serial"],
+                        "sha256": sha256, "sha1": hashlib.sha1(der).hexdigest(),
+                        "not_before": utc(ssl.cert_time_to_seconds(d["not_before"])), "not_after": utc(end),
+                        "days_left": days,
+                        "status": "expired" if end <= now else ("expiring" if days <= warn else "ok"),
+                        "self_signed": d["subject"] == d["issuer"], "dns_names": d["dns_names"],
+                        "paths": [], "used_by": []}
+            except (ValueError, OSError, KeyError) as e:
+                log.debug("cannot read a certificate in %s: %s", path, e)
+                continue
+            c = certs[sha256]
+            if path not in c["paths"]:
+                c["paths"].append(path)
+            for conf in sorted(refs.get(path, set()) | refs_real.get(real, set())):
+                if conf not in c["used_by"]:
+                    c["used_by"].append(conf)
+    return sorted(certs.values(), key=lambda c: (c["not_after"], c["name"]))
+
+
+# --------------------------------------------------------------------------
 # filesystem scanner for application libraries
 # --------------------------------------------------------------------------
 
@@ -1130,7 +1279,8 @@ def collect(cfg, args, state_dir, refresh=True):
     inv = {"os": {"id": osr.get("ID"), "name": osr.get("PRETTY_NAME"), "version": osr.get("VERSION_ID")},
            "package_manager": pm, "osv_ecosystem": osv_os_ecosystem(osr, cfg),
            "kernel": os.uname().release, "os_packages": [], "runtimes": [], "libraries": [],
-           "projects": [], "unidentified_jars": [], "os_updates": [], "errors": []}
+           "projects": [], "unidentified_jars": [], "os_updates": [], "certificates": [],
+           "cert_warning_days": int(cfg["cert_warning_days"]), "errors": []}
     if refresh and pm and cfg["refresh_package_index"] and is_root():
         log.info("refreshing package index (%s)", pm)
         refresh_index(pm)
@@ -1147,6 +1297,12 @@ def collect(cfg, args, state_dir, refresh=True):
         inv["libraries"] = sc.scan()
         inv["projects"] = list(sc.projects.values())
         inv["unidentified_jars"] = sc.unidentified_jars
+    if cfg["scan_certificates"]:
+        log.info("looking for certificates: %s", ", ".join(p for p in cfg["cert_paths"] if os.path.isdir(p)))
+        try:
+            inv["certificates"] = inventory_certificates(cfg)
+        except Exception as e:
+            inv["errors"].append("certificate scan failed: %s" % e)
     return inv
 
 
@@ -1571,9 +1727,14 @@ def build_report(inv, findings, actions, applied, restart, prev):
             "os_updates_pending": len(inv["os_updates"]),
             "os_security_updates_pending": sum(1 for u in inv["os_updates"] if u["security"]),
             "eol_runtimes": sum(1 for r in inv["runtimes"] if r["status"] == "eol"),
+            "certificates": len(inv["certificates"]),
+            "certificates_expired": sum(1 for c in inv["certificates"] if c["status"] == "expired"),
+            "certificates_expiring": sum(1 for c in inv["certificates"] if c["status"] == "expiring"),
             "applied": applied,
         },
         "runtimes": inv["runtimes"],
+        "certificates": inv["certificates"],
+        "cert_warning_days": inv["cert_warning_days"],
         "findings": findings,
         "new_findings": [keyf(f) for f in new],
         "backported": inv.get("backported", []),
@@ -1588,7 +1749,8 @@ def build_report(inv, findings, actions, applied, restart, prev):
 
 
 _COL = {"CRITICAL": "\033[1;97;41m", "HIGH": "\033[1;31m", "MEDIUM": "\033[33m", "LOW": "\033[36m",
-        "UNKNOWN": "\033[2m", "eol": "\033[1;31m", "outdated": "\033[33m", "ok": "\033[32m"}
+        "UNKNOWN": "\033[2m", "eol": "\033[1;31m", "outdated": "\033[33m", "ok": "\033[32m",
+        "expired": "\033[1;31m", "expiring": "\033[33m"}
 
 
 def text_report(rep, limit=40, color=False):
@@ -1616,6 +1778,14 @@ def text_report(rep, limit=40, color=False):
                 extra = " (EOL since %s)" % r["eol_date"]
             out.append("  %-7s %-14s %-9s%s  %s%s" % (r["runtime"], r["version"], c(r["status"], st), extra,
                                                      r["path"], " [pkg %s]" % r["os_package"] if r["os_package"] else ""))
+    certs = rep.get("certificates") or []
+    if certs:
+        out.append("\nCertificates: %d   expired: %d   expiring within %d days: %d" % (
+            len(certs), s["certificates_expired"], rep["cert_warning_days"], s["certificates_expiring"]))
+        for x in [x for x in certs if x["status"] != "ok"][:limit]:
+            st = "EXPIRED" if x["status"] == "expired" else "%d days" % x["days_left"]
+            out.append("  %s %s  until %s  %s" % (c(x["status"], "%-8s" % st), x["name"], x["not_after"][:10],
+                                                 ", ".join(x["paths"][:2])))
     groups = {}
     for f in rep["findings"]:
         k = (f["ecosystem"], f["name"], f["version"], f.get("location") or ",".join(f.get("binaries", [])[:3]))
@@ -1683,6 +1853,10 @@ def html_report(rep):
     rts = "".join("<tr><td>%s</td><td>%s</td><td class='st-%s'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
         e(r["runtime"]), e(r["version"]), e(r["status"]), e(r["status"].upper()), e(r["latest"] or "-"),
         e(r["path"]), e(r["os_package"] or "-")) for r in rep["runtimes"])
+    certs = "".join("<tr><td class='st-%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=loc>%s</td></tr>" % (
+        e(c["status"]), "EXPIRED" if c["status"] == "expired" else "%d days" % c["days_left"], e(c["name"]),
+        e(c["not_after"][:10]), e(c["issuer"]), e(", ".join(c["dns_names"][:5])),
+        e(", ".join(c["paths"] + ["used by " + u for u in c["used_by"]]))) for c in rep.get("certificates") or [])
     plan = "".join("<li><b>%s</b> %s<br><code>%s</code></li>" % (
         "[manual]" if a.get("manual") else ("[auto]" if a.get("enabled") else "[off]"), e(a["title"]),
         e(a.get("detail") or " ".join(a.get("cmd", [])) + ((" &rarr; " + a["result"]) if a.get("result") else "")))
@@ -1699,18 +1873,20 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 8px}.mut{color:
 .n{font-size:24px;font-weight:700}table{border-collapse:collapse;width:100%%;font-size:13px}
 td,th{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
 .sev{color:#fff;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:700}.loc{word-break:break-all;color:var(--mut)}
-.st-eol{color:#b00020;font-weight:700}.st-outdated{color:#e65100}.st-ok{color:#2e7d32}code{font-size:12px;word-break:break-all}
+.st-eol,.st-expired{color:#b00020;font-weight:700}.st-outdated,.st-expiring{color:#e65100}.st-ok{color:#2e7d32}code{font-size:12px;word-break:break-all}
 a{color:inherit}.wrap{overflow-x:auto}li{margin-bottom:8px}</style></head><body>
 <h1>Vulnerability report &ndash; %(host)s</h1>
 <div class=mut>%(os)s &middot; kernel %(kernel)s &middot; %(gen)s &middot; %(agent)s</div>
 <div class=cards>%(cards)s<div class=card><div class=n>%(pk)d</div>vulnerable pkgs</div>
 <div class=card><div class=n>%(upd)d</div>OS updates (%(sec)d sec)</div></div>
 <h2>Runtimes</h2><div class=wrap><table><tr><th>Runtime</th><th>Version</th><th>Status</th><th>Latest</th><th>Path</th><th>OS package</th></tr>%(rts)s</table></div>
+<h2>Certificates (%(nc)d)</h2><div class=wrap><table><tr><th>Expires in</th><th>Name</th><th>Valid until</th><th>Issuer</th><th>DNS names</th><th>Location</th></tr>%(certs)s</table></div>
 <h2>Vulnerabilities (%(nv)d)</h2><div class=wrap><table><tr><th>Severity</th><th>Ecosystem</th><th>Package</th><th>Installed</th><th>Fixed in</th><th>ID</th><th>Summary</th><th>Location</th></tr>%(rows)s</table></div>
 <h2>Remediation plan</h2><ul>%(plan)s</ul></body></html>""" % {
         "host": e(rep["host"]), "os": e(rep["os"].get("name") or ""), "kernel": e(rep["kernel"]),
         "gen": e(rep["generated"]), "agent": e(rep["agent"]), "cards": cards, "pk": s["vulnerable_packages"],
         "upd": s["os_updates_pending"], "sec": s["os_security_updates_pending"], "rts": rts,
+        "nc": len(rep.get("certificates") or []), "certs": certs,
         "nv": len(rep["findings"]), "rows": "".join(rows), "plan": plan or "<li>nothing to do</li>"}
 
 
@@ -1745,6 +1921,9 @@ def notify(rep, cfg):
         if s["eol_runtimes"]:
             lines.append("EOL runtimes: " + ", ".join("%s %s" % (r["runtime"], r["version"])
                                                        for r in rep["runtimes"] if r["status"] == "eol"))
+        if s.get("certificates_expired") or s.get("certificates_expiring"):
+            lines.append("Certificates: %d expired, %d expiring within %d days" % (
+                s["certificates_expired"], s["certificates_expiring"], rep["cert_warning_days"]))
         top = [f for f in rep["findings"] if f["severity"] in ("CRITICAL", "HIGH")][:8]
         for f in top:
             lines.append("- %s %s %s %s -> %s (%s)" % (f["severity"], f["ecosystem"], f["name"], f["version"],
@@ -1867,6 +2046,8 @@ def main(argv=None):
                 print("runtime  %-7s %-12s %-9s %s" % (r["runtime"], r["version"], r["status"], r["path"]))
             for l in sorted(inv["libraries"], key=lambda l: (l["ecosystem"], l["name"])):
                 print("%-9s %-50s %-16s %-11s %s" % (l["ecosystem"], l["name"], l["version"], l["manager"], l["location"]))
+            for c in inv["certificates"]:
+                print("cert     %-8s %-40s %s  %s" % (c["status"], c["name"], c["not_after"][:10], c["paths"][0]))
             print("%d libraries, %d projects, %d OS updates pending" % (
                 len(inv["libraries"]), len(inv["projects"]), len(inv["os_updates"])))
         return 0
