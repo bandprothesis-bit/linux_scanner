@@ -1,0 +1,1874 @@
+<#
+.SYNOPSIS
+    vulnagent hardening for Windows: checks the machine against the Microsoft
+    security baselines, applies the recommended settings when asked, and sends
+    the result to DefectDojo.
+
+.DESCRIPTION
+    The checks come from the Microsoft Security Compliance Toolkit baselines:
+
+      * Windows Server 2025 (v2602), Member Server profile, for servers,
+      * the Domain Controller profile of the same baseline for DCs,
+      * Windows 11 v25H2 for workstations,
+
+    plus Microsoft's TLS, PowerShell 2.0 and Print Spooler guidance. Settings
+    that need a newer Windows than the machine runs are skipped.
+
+    Without -Apply the script only reads. Each run:
+
+      * checks about 130 settings: SMB, NTLM and LSA protection, UAC,
+        password and lockout policy, user rights, audit policy, event log
+        sizes, Defender and attack surface reduction rules, firewall, RDP,
+        WinRM, TLS and more,
+      * uploads one finding per failed check to DefectDojo (engagement
+        "hardening" in the machine's product); fixed checks are closed,
+      * writes an HTML report to
+        C:\ProgramData\vulnagent\reports\hardening.html (and to -Html).
+
+    Every check is marked:
+      safe    can be applied without breaking a normal, current environment
+      review  can break old clients or applications: test first
+      manual  needs hardware, Active Directory or a decision (not automatic)
+
+    -Apply safe changes the failed "safe" checks, -Apply all also the "review"
+    ones. Before a change the old value is saved to
+    C:\ProgramData\vulnagent\hardening\backup-<time>.json, and -Undo puts it
+    back. In a domain, settings that a Group Policy sets win over local
+    changes: apply the Microsoft baseline GPOs there instead.
+
+    Needs Windows PowerShell 5.1 and an elevated prompt (or SYSTEM).
+
+    Exit codes: 0 done, 2 uploaded but some checks or changes failed,
+    3 failed (nothing uploaded).
+
+.EXAMPLE
+    vulnagent-harden.ps1 -DryRun -Html $env:TEMP\hardening.html
+    Check only, without uploading, and write the report where your browser
+    can open it.
+
+.EXAMPLE
+    vulnagent-harden.ps1
+    Check and upload to DefectDojo, using C:\ProgramData\vulnagent\defectdojo.json.
+
+.EXAMPLE
+    vulnagent-harden.ps1 -Apply safe -DryRun
+    Show what -Apply safe would change, without changing anything.
+
+.EXAMPLE
+    vulnagent-harden.ps1 -Apply all -Only SMB-*, LSA-03
+    Apply the failed SMB checks and LSA-03, including "review" ones.
+
+.EXAMPLE
+    vulnagent-harden.ps1 -Undo last
+    Put back the values that the last -Apply changed.
+
+.EXAMPLE
+    vulnagent-harden.ps1 -List
+    List all checks that apply to this machine.
+#>
+[CmdletBinding()]
+param(
+    [string]$ConfigPath,
+    [string]$Url,
+    [string]$Token,
+    [switch]$Insecure,
+    [switch]$DryRun,
+    [string]$Output,
+    [string]$Html,
+    [ValidateSet('safe', 'all')][string]$Apply,
+    [string[]]$Only,
+    [string[]]$Exclude,
+    [string]$Undo,
+    [switch]$List
+)
+
+$ErrorActionPreference = 'Stop'
+$VERSION = '1.0.0'
+$SCAN_TYPE = 'Generic Findings Import'
+$DataDir = Join-Path $env:ProgramData 'vulnagent'
+if (-not $ConfigPath) { $ConfigPath = Join-Path $DataDir 'defectdojo.json' }
+$LogFile = Join-Path $DataDir 'hardening.log'
+$BackupDir = Join-Path $DataDir 'hardening'
+
+$DefaultConfig = [ordered]@{
+    url                      = ''                 # http://dojo.example.local:8080
+    api_token                = ''                 # DefectDojo API v2 key (or env DD_API_TOKEN)
+    product_type             = 'Windows servers'
+    product_name             = '{host}'           # {host} = FQDN, {short} = computer name
+    hardening_engagement     = 'hardening'
+    hardening_test_title     = 'hardening'
+    close_old_findings       = $true
+    minimum_severity         = 'Info'
+    hardening_exclude        = @()                # accepted deviations: check IDs (wildcards allowed)
+    hardening_include_passed = $false             # also send passed checks, as Info
+    verify_tls               = $true
+    timeout                  = 600
+}
+
+$SeverityOrder = [ordered]@{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
+$StatusOrder = @{ fail = 0; error = 1; exception = 2; pass = 3 }
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+function Write-Log([string]$Message) {
+    $line = '{0} {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Message
+    Write-Host $Message
+    try {
+        if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 2MB) {
+            Move-Item $LogFile "$LogFile.1" -Force
+        }
+        Add-Content -Path $LogFile -Value $line -Encoding UTF8
+    } catch { }
+}
+
+function Write-TextFile([string]$Path, [string]$Text) {
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
+}
+
+function Write-JsonFile([string]$Path, $Object) {
+    Write-TextFile $Path (ConvertTo-Json -InputObject $Object -Depth 10)
+}
+
+function Get-Clip([string]$Text, [int]$Max) {
+    if ($Text.Length -le $Max) { return $Text }
+    $Text.Substring(0, $Max - 3) + '...'
+}
+
+function Read-Config([string]$Path) {
+    $cfg = [ordered]@{}
+    foreach ($k in $DefaultConfig.Keys) { $cfg[$k] = $DefaultConfig[$k] }
+    if (Test-Path $Path) {
+        $j = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        foreach ($p in $j.PSObject.Properties) {
+            if (-not $p.Name.StartsWith('_')) { $cfg[$p.Name] = $p.Value }
+        }
+    }
+    $cfg
+}
+
+function Assert-Admin {
+    $me = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Run this from an elevated PowerShell (right-click > Run as administrator).'
+    }
+}
+
+function Initialize-DataDir {
+    if (-not (Test-Path $DataDir)) {
+        # same access as install.ps1 sets: SYSTEM and Administrators only
+        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+        & icacls.exe $DataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    }
+    foreach ($d in (Join-Path $DataDir 'reports'), $BackupDir) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+}
+
+function Test-IdMatch([string]$Id, [string]$Area, $Patterns) {
+    foreach ($p in @($Patterns)) {
+        if ($p -and ($Id -like $p -or $Area -eq $p)) { return $true }
+    }
+    $false
+}
+
+# --------------------------------------------------------------------------
+# machine
+# --------------------------------------------------------------------------
+
+function Get-HostInfo {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $name = if ($cs.DNSHostName) { $cs.DNSHostName } else { $env:COMPUTERNAME }
+    $fqdn = if ($cs.PartOfDomain) { '{0}.{1}' -f $name, $cs.Domain } else { $name }
+    $release = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+    $role = [int]$cs.DomainRole    # 0/1 workstation, 2/3 server, 4/5 domain controller
+    [pscustomobject]@{
+        host    = $fqdn.ToLower()
+        short   = $name.ToLower()
+        os      = "$($os.Caption)".Trim()
+        version = "$($os.Version)"
+        ubr     = "$($cv.UBR)"
+        release = "$release"
+        build   = [int]$os.BuildNumber
+        server  = ($os.ProductType -ne 1)
+        dc      = ($role -ge 4)
+        domain  = [bool]$cs.PartOfDomain
+        role    = @('standalone workstation', 'domain member workstation', 'standalone server',
+                    'domain member server', 'domain controller', 'domain controller')[$role]
+    }
+}
+
+function Get-BaselineName($H) {
+    if ($H.dc) { return 'Microsoft security baseline Windows Server 2025 v2602 (Domain Controller)' }
+    if ($H.server) { return 'Microsoft security baseline Windows Server 2025 v2602 (Member Server)' }
+    'Microsoft security baseline Windows 11 v25H2'
+}
+
+# Defender state, plus the audit and security policy (read once, when a check needs them)
+function New-Context {
+    $ctx = @{ defender = $false; mp = $null; mpMode = 'not installed' }
+    try {
+        $st = Get-MpComputerStatus
+        $mode = "$($st.AMRunningMode)"
+        if (-not $mode) { $mode = if ($st.AntivirusEnabled) { 'Normal' } else { 'turned off' } }
+        $ctx.mpMode = $mode
+        $ctx.defender = ($mode -eq 'Normal')
+        if ($ctx.defender) { $ctx.mp = Get-MpPreference }
+    } catch { }
+    $ctx
+}
+
+# --------------------------------------------------------------------------
+# reading and writing settings
+# --------------------------------------------------------------------------
+
+function Get-RegValue([string]$Path, [string]$Name) {
+    $k = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $k -or @($k.GetValueNames()) -notcontains $Name) { return @{ exists = $false; value = $null; kind = $null } }
+    @{ exists = $true; value = $k.GetValue($Name, $null, 'DoNotExpandEnvironmentNames'); kind = "$($k.GetValueKind($Name))" }
+}
+
+function Set-RegValue([string]$Path, [string]$Name, $Value, [string]$Type) {
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+# Remove-ItemProperty would read the * in names like \\*\SYSVOL as a wildcard
+function Remove-RegValue([string]$Path, [string]$Name) {
+    if (-not (Get-RegValue $Path $Name).exists) { return }
+    $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(($Path -replace '^HKLM:\\', ''), $true)
+    try { $k.DeleteValue($Name) } finally { $k.Close() }
+}
+
+# 1 success, 2 failure, 3 both, by subcategory GUID (auditpol /backup is the same in every language)
+function Get-AuditPolicy {
+    $f = Join-Path $BackupDir "auditpol-$PID.csv"
+    try {
+        $out = & auditpol.exe /backup "/file:$f" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "auditpol /backup failed (exit $LASTEXITCODE): $out" }
+        $map = @{}
+        $rows = Get-Content $f | Select-Object -Skip 1 | ConvertFrom-Csv -Header machine, target, sub, guid, incl, excl, value
+        foreach ($r in $rows) { if ($r.guid -match '^\{') { $map[$r.guid.ToLower()] = [int]$r.value } }
+        $map
+    } finally { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+}
+
+function Set-AuditValue([string]$Guid, [int]$Value) {
+    $s = if ($Value -band 1) { 'enable' } else { 'disable' }
+    $f = if ($Value -band 2) { 'enable' } else { 'disable' }
+    $out = & auditpol.exe /set "/subcategory:$Guid" "/success:$s" "/failure:$f" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "auditpol /set failed (exit $LASTEXITCODE): $out" }
+}
+
+# [System Access] and [Privilege Rights] of the local security policy
+function Get-SecPolicy {
+    $f = Join-Path $BackupDir "secedit-$PID.inf"
+    try {
+        $out = & secedit.exe /export /cfg "$f" /areas SECURITYPOLICY USER_RIGHTS /quiet 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "secedit /export failed (exit $LASTEXITCODE): $out" }
+        $ini = @{}; $sec = ''
+        foreach ($l in (Get-Content $f)) {
+            if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1]; $ini[$sec] = @{}; continue }
+            if ($sec -and $l -match '^\s*([^=;]+?)\s*=\s*(.*?)\s*$') { $ini[$sec][$Matches[1]] = $Matches[2] }
+        }
+        $ini
+    } finally { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+}
+
+function Invoke-Secedit([string]$Section, $Values) {
+    $inf = Join-Path $BackupDir "apply-$PID.inf"
+    $db = Join-Path $BackupDir "apply-$PID.sdb"
+    $lines = @('[Unicode]', 'Unicode=yes', '[Version]', 'signature="$CHICAGO$"', 'Revision=1', "[$Section]")
+    foreach ($k in $Values.Keys) { $lines += '{0} = {1}' -f $k, $Values[$k] }
+    [IO.File]::WriteAllLines($inf, [string[]]$lines, [Text.Encoding]::Unicode)
+    $area = if ($Section -eq 'Privilege Rights') { 'USER_RIGHTS' } else { 'SECURITYPOLICY' }
+    try {
+        $out = & secedit.exe /configure /db "$db" /cfg "$inf" /areas $area /quiet 2>&1
+        # warnings also give a non-zero exit; the check that runs afterwards shows what really changed
+        if ($LASTEXITCODE -ne 0) { Write-Log "  secedit /configure exit ${LASTEXITCODE}: $out" }
+    } finally {
+        Remove-Item $inf, $db, ($db -replace '\.sdb$', '.jfm') -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$script:SidNames = @{}
+function Resolve-Sid([string]$Sid) {
+    if (-not $Sid.StartsWith('*')) { return $Sid }
+    if (-not $script:SidNames.ContainsKey($Sid)) {
+        $n = $Sid.Substring(1)
+        try { $n = (New-Object Security.Principal.SecurityIdentifier $n).Translate([Security.Principal.NTAccount]).Value } catch { }
+        $script:SidNames[$Sid] = $n
+    }
+    $script:SidNames[$Sid]
+}
+
+# --------------------------------------------------------------------------
+# comparing
+# --------------------------------------------------------------------------
+
+function Test-Value($Value, $Want, [string]$Op) {
+    try {
+        switch ($Op) {
+            'eq'      { if ($Want -is [string]) { return (("$Value" -replace '\s', '') -eq ($Want -replace '\s', '')) }
+                        return ([long]$Value -eq [long]$Want) }
+            'ge'      { return ([long]$Value -ge [long]$Want) }
+            'le'      { return ([long]$Value -le [long]$Want) }
+            'range'   { return ([long]$Value -ge [long]$Want[0] -and [long]$Value -le [long]$Want[1]) }
+            'in'      { return (@($Want | ForEach-Object { "$_" }) -contains "$Value") }
+            'minutes' { return ([long]$Value -eq -1 -or [long]$Value -ge [long]$Want) }
+        }
+    } catch { }
+    $false
+}
+
+function Format-Value($Value) {
+    if ($Value -is [array]) { return (@($Value) -join ', ') }
+    "$Value"
+}
+
+function Format-Want($Want, [string]$Op) {
+    switch ($Op) {
+        'ge'      { return ">= $Want" }
+        'le'      { return "<= $Want" }
+        'range'   { return "$($Want[0]) to $($Want[1])" }
+        'in'      { return (@($Want) -join ' or ') }
+        'absent'  { return 'not set' }
+        'minutes' { return ">= $Want (or -1: until an admin unlocks)" }
+    }
+    Format-Value $Want
+}
+
+function Format-Audit([int]$Value) {
+    @('No auditing', 'Success', 'Failure', 'Success and Failure')[$Value -band 3]
+}
+
+function New-CheckItem([string]$Setting, [string]$Want, [string]$Now, [bool]$Ok) {
+    [pscustomobject]@{ setting = $Setting; want = $Want; now = $Now; ok = $Ok }
+}
+
+# --------------------------------------------------------------------------
+# check kinds: reg, audit, sec (local security policy), mp (Defender), asr, custom
+# --------------------------------------------------------------------------
+
+function Reg([string]$Path, [string]$Name, $Want, [string]$Op = 'eq', $Default = $null, [string]$Type = 'DWord', $Set = $null, [string]$Note) {
+    @{ path = $Path; name = $Name; want = $Want; op = $Op; default = $Default; type = $Type; set = $Set; note = $Note }
+}
+
+function Sec([string]$Section, [string]$Key, [string]$Label, $Want, [string]$Op = 'eq', $Set = $null) {
+    @{ section = $Section; key = $Key; label = $Label; want = $Want; op = $Op; set = $Set }
+}
+
+function Test-RegCheck($C) {
+    $state = @(); $shown = @()
+    foreach ($i in $C.items) {
+        $r = Get-RegValue $i.path $i.name
+        # never keep the value of a setting that should not exist (it can be a password)
+        $v = if ($i.op -eq 'absent') { $null } else { $r.value }
+        $state += [pscustomobject]@{ path = $i.path; name = $i.name; exists = $r.exists; value = $v; kind = $r.kind }
+        if ($i.op -eq 'absent') {
+            $ok = -not $r.exists
+            $now = if ($r.exists) { 'set' } else { 'not set' }
+        } elseif ($r.exists) {
+            $ok = Test-Value $r.value $i.want $i.op
+            $now = Format-Value $r.value
+        } elseif ($null -ne $i.default) {
+            $ok = Test-Value $i.default $i.want $i.op
+            $now = 'not set (Windows default: ' + (Format-Value $i.default) + ')'
+        } else {
+            $ok = $false
+            $now = 'not set'
+        }
+        if ($i.note -and -not $r.exists) { $now = $i.note }
+        $label = ($i.path -replace '^HKLM:\\', 'HKLM\') + '\' + $i.name
+        $shown += [pscustomobject]@{ setting = $label; want = (Format-Want $i.want $i.op); now = $now; ok = $ok; exists = $r.exists }
+    }
+    if ($C.match -eq 'any') {
+        $ok = @($shown | Where-Object { $_.ok }).Count -gt 0
+    } elseif ($C.match -eq 'first') {
+        # the first value that is set decides (a policy value over the local one)
+        $d = @($shown | Where-Object { $_.exists })
+        $d = if ($d.Count) { $d[0] } else { $shown[-1] }
+        $shown = @($d)
+        $ok = $d.ok
+    } else {
+        $ok = @($shown | Where-Object { -not $_.ok }).Count -eq 0
+    }
+    @{ ok = $ok; items = @($shown | Select-Object setting, want, now, ok); state = $state }
+}
+
+function Set-RegCheck($C) {
+    $targets = if ($C.match -eq 'any' -or $C.match -eq 'first') { @($C.items[0]) } else { $C.items }
+    foreach ($i in $targets) {
+        if ($i.op -eq 'absent') { Remove-RegValue $i.path $i.name; continue }
+        $r = Get-RegValue $i.path $i.name
+        if ($r.exists -and (Test-Value $r.value $i.want $i.op)) { continue }
+        $v = if ($null -ne $i.set) { $i.set } elseif ($i.want -is [array]) { $i.want[0] } else { $i.want }
+        Set-RegValue $i.path $i.name $v $i.type
+    }
+}
+
+function Restore-RegState($State) {
+    foreach ($s in @($State)) {
+        if ($s.exists) {
+            $v = $s.value
+            switch ("$($s.kind)") {
+                'Binary'      { $v = [byte[]]@($v) }
+                'MultiString' { $v = [string[]]@($v) }
+            }
+            Set-RegValue $s.path $s.name $v "$($s.kind)"
+        } else {
+            Remove-RegValue $s.path $s.name
+        }
+    }
+}
+
+function Get-CtxAudit($Ctx) {
+    if (-not $Ctx.ContainsKey('audit')) { $Ctx.audit = $null; $Ctx.audit = Get-AuditPolicy }
+    if ($null -eq $Ctx.audit) { throw 'the audit policy could not be read (auditpol /backup)' }
+    $Ctx.audit
+}
+
+function Get-CtxSec($Ctx) {
+    if (-not $Ctx.ContainsKey('sec')) { $Ctx.sec = $null; $Ctx.sec = Get-SecPolicy }
+    if ($null -eq $Ctx.sec) { throw 'the local security policy could not be read (secedit /export)' }
+    $Ctx.sec
+}
+
+function Test-AuditCheck($C, $Ctx) {
+    $map = Get-CtxAudit $Ctx
+    $cur = 0
+    if ($map.ContainsKey($C.guid)) { $cur = [int]$map[$C.guid] }
+    $ok = ($cur -band $C.want) -eq $C.want
+    @{ ok = $ok; state = @{ guid = $C.guid; value = $cur }
+       items = @(New-CheckItem "Advanced audit policy: $($C.sub)" "$(Format-Audit $C.want) (at least)" (Format-Audit $cur) $ok) }
+}
+
+function Get-RightList([string]$Raw) {
+    @("$Raw" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Test-SecCheck($C, $Ctx) {
+    $ini = Get-CtxSec $Ctx
+    $state = @(); $shown = @()
+    foreach ($i in $C.items) {
+        $sect = $ini[$i.section]
+        if (-not $sect) { $sect = @{} }
+        $exists = $sect.ContainsKey($i.key)
+        $raw = if ($exists) { $sect[$i.key] } else { $null }
+        $state += [pscustomobject]@{ section = $i.section; key = $i.key; exists = $exists; value = $raw }
+        if ($i.section -eq 'Privilege Rights') {
+            $cur = Get-RightList $raw
+            $want = @($i.want)
+            if ($i.op -eq 'only') {
+                $ok = @($cur | Where-Object { $want -notcontains $_ }).Count -eq 0
+                $w = if ($want.Count) { 'only ' + (($want | ForEach-Object { Resolve-Sid $_ }) -join ', ') } else { 'no one' }
+            } else {
+                $ok = @($want | Where-Object { $cur -notcontains $_ }).Count -eq 0
+                $w = 'includes ' + (($want | ForEach-Object { Resolve-Sid $_ }) -join ', ')
+            }
+            $now = if ($cur.Count) { ($cur | ForEach-Object { Resolve-Sid $_ }) -join ', ' } else { 'no one' }
+        } else {
+            $ok = $exists -and (Test-Value $raw $i.want $i.op)
+            $now = if ($exists) { "$raw" } else { 'not set' }
+            $w = Format-Want $i.want $i.op
+        }
+        $shown += New-CheckItem $i.label $w $now $ok
+    }
+    @{ ok = (@($shown | Where-Object { -not $_.ok }).Count -eq 0); items = $shown; state = $state }
+}
+
+function Set-SecCheck($C) {
+    $ini = Get-SecPolicy
+    $bySection = [ordered]@{}
+    foreach ($i in $C.items) {
+        $sect = $ini[$i.section]
+        if (-not $sect) { $sect = @{} }
+        $raw = if ($sect.ContainsKey($i.key)) { $sect[$i.key] } else { $null }
+        if ($i.section -eq 'Privilege Rights') {
+            $cur = Get-RightList $raw
+            $want = @($i.want)
+            $new = if ($i.op -eq 'only') { @($cur | Where-Object { $want -contains $_ }) }
+                   else { @($cur) + @($want | Where-Object { $cur -notcontains $_ }) }
+            if (($new -join ',') -eq ($cur -join ',')) { continue }
+            $val = $new -join ','
+        } else {
+            if ($null -ne $raw -and (Test-Value $raw $i.want $i.op)) { continue }
+            $val = if ($null -ne $i.set) { $i.set } else { $i.want }
+        }
+        if (-not $bySection.Contains($i.section)) { $bySection[$i.section] = [ordered]@{} }
+        $bySection[$i.section][$i.key] = $val
+    }
+    foreach ($s in $bySection.Keys) { Invoke-Secedit $s $bySection[$s] }
+}
+
+function Restore-SecState($State) {
+    $bySection = [ordered]@{}
+    foreach ($s in @($State)) {
+        if (-not $s.exists -and $s.section -ne 'Privilege Rights') { continue }    # cannot be "unset"
+        if (-not $bySection.Contains($s.section)) { $bySection[$s.section] = [ordered]@{} }
+        $bySection[$s.section][$s.key] = $(if ($s.exists) { "$($s.value)" } else { '' })
+    }
+    foreach ($s in $bySection.Keys) { Invoke-Secedit $s $bySection[$s] }
+}
+
+function Test-MpCheck($C, $Ctx) {
+    $cur = $Ctx.mp.($C.pref)
+    $ok = if ($C.want -is [bool]) { [bool]$cur -eq $C.want } else { Test-Value $cur $C.want $C.op }
+    $now = if ($null -eq $cur) { 'not set' } else { "$cur" }
+    @{ ok = $ok; state = @{ pref = $C.pref; value = $cur }
+       items = @(New-CheckItem "Defender: $($C.pref)" (Format-Want $C.want $C.op) $now $ok) }
+}
+
+$AsrActions = @{ 0 = 'off'; 1 = 'block'; 2 = 'audit'; 6 = 'warn' }
+
+function Test-AsrCheck($C, $Ctx) {
+    $ids = @($Ctx.mp.AttackSurfaceReductionRules_Ids)
+    $acts = @($Ctx.mp.AttackSurfaceReductionRules_Actions)
+    $cur = $null
+    for ($i = 0; $i -lt $ids.Count; $i++) { if ("$($ids[$i])" -eq $C.guid) { $cur = [int]$acts[$i] } }
+    $ok = $null -ne $cur -and @($C.accept) -contains $cur
+    $now = if ($null -eq $cur) { 'not configured' } elseif ($AsrActions.ContainsKey($cur)) { $AsrActions[$cur] } else { "$cur" }
+    @{ ok = $ok; state = @{ guid = $C.guid; action = $cur }
+       items = @(New-CheckItem "ASR rule $($C.guid)" $AsrActions[[int]$C.want] $now $ok) }
+}
+
+function Test-Check($C, $Ctx) {
+    switch ($C.kind) {
+        'reg'    { return (Test-RegCheck $C) }
+        'audit'  { return (Test-AuditCheck $C $Ctx) }
+        'sec'    { return (Test-SecCheck $C $Ctx) }
+        'mp'     { return (Test-MpCheck $C $Ctx) }
+        'asr'    { return (Test-AsrCheck $C $Ctx) }
+        'custom' { return (& $C.get $C $Ctx) }
+    }
+    throw "unknown check kind $($C.kind)"
+}
+
+function Invoke-Fix($C, $R) {
+    switch ($C.kind) {
+        'reg'    { Set-RegCheck $C }
+        'audit'  { Set-AuditValue $C.guid ([int]$R.state.value -bor $C.want) }
+        'sec'    { Set-SecCheck $C }
+        'mp'     { $p = @{}; $p[$C.pref] = $(if ($null -ne $C.set) { $C.set } else { $C.want }); Set-MpPreference @p }
+        'asr'    { Add-MpPreference -AttackSurfaceReductionRules_Ids $C.guid -AttackSurfaceReductionRules_Actions ([int]$C.want) }
+        'custom' { & $C.set $C $R.state }
+    }
+}
+
+function Invoke-Restore($C, $State) {
+    switch ($C.kind) {
+        'reg'    { Restore-RegState $State }
+        'audit'  { Set-AuditValue $State.guid ([int]$State.value) }
+        'sec'    { Restore-SecState $State }
+        'mp'     { $p = @{}; $p[$State.pref] = $State.value; Set-MpPreference @p }
+        'asr'    {
+            if ($null -ne $State.action) {
+                Add-MpPreference -AttackSurfaceReductionRules_Ids $State.guid -AttackSurfaceReductionRules_Actions ([int]$State.action)
+            } else {
+                Remove-MpPreference -AttackSurfaceReductionRules_Ids $State.guid
+            }
+        }
+        'custom' { & $C.restore $C $State }
+    }
+}
+
+# --------------------------------------------------------------------------
+# the checks
+# --------------------------------------------------------------------------
+
+function Get-Catalog($H) {
+    $Pol = 'HKLM:\SOFTWARE\Policies\Microsoft'
+    $PW = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
+    $PNT = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT'
+    $TS = "$PNT\Terminal Services"
+    $SysP = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $ExpP = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    $Svc = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    $Lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+    $Msv = "$Lsa\MSV1_0"
+    $Sch = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+    $SA = 'System Access'
+    $PR = 'Privilege Rights'
+    $Admins = '*S-1-5-32-544'
+    $srv = [bool]$H.server
+    $old = $H.build -lt 14393     # before Windows 10 1607 / Server 2016: SSL 3.0 still on by default
+
+    $list = New-Object Collections.Generic.List[hashtable]
+
+    # --- SMB -------------------------------------------------------------
+    $list.Add(@{ id = 'SMB-01'; area = 'SMB'; sev = 'High'; fix = 'safe'; kind = 'custom'
+        title = 'Turn off the SMB 1.0 server'
+        why = 'SMB 1.0 has no encryption and no protection against tampering; WannaCry and NotPetya spread through it.'
+        ms = 'MS Security Guide: Configure SMB v1 server = Disabled'
+        impact = 'Windows XP / Server 2003 and very old printers, scanners and NAS boxes can no longer open shares on this machine.'
+        get = { param($C, $Ctx)
+            $on = [bool](Get-SmbServerConfiguration).EnableSMB1Protocol
+            @{ ok = -not $on; state = $on; items = @(New-CheckItem 'SMB server: EnableSMB1Protocol' 'False' "$on" (-not $on)) } }
+        set = { param($C, $S) Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -Confirm:$false }
+        restore = { param($C, $S) Set-SmbServerConfiguration -EnableSMB1Protocol ([bool]$S) -Force -Confirm:$false } })
+    $list.Add(@{ id = 'SMB-02'; area = 'SMB'; sev = 'High'; fix = 'review'; reboot = $true
+        title = 'Turn off the SMB 1.0 client'
+        why = 'With the SMB 1.0 client, this machine can be talked into using the insecure protocol by a malicious or old server.'
+        ms = 'MS Security Guide: Configure SMB v1 client driver = Disable driver'
+        impact = 'Shares on very old NAS boxes or Windows Server 2003 can no longer be opened from this machine.'
+        items = @(Reg "$Svc\MrxSmb10" 'Start' 4 -Note 'not installed (fine)' -Default 4) })
+    $list.Add(@{ id = 'SMB-03'; area = 'SMB'; sev = 'Medium'; fix = 'review'
+        title = 'Require SMB signing on the server side'
+        why = 'Without signing, an attacker in the network can relay or change SMB traffic (NTLM relay).'
+        ms = 'Microsoft network server: Digitally sign communications (always) = Enabled'
+        impact = 'Clients that cannot sign (very old devices) can no longer connect; signing costs some file copy speed.'
+        items = @(Reg "$Svc\LanManServer\Parameters" 'RequireSecuritySignature' 1) })
+    $list.Add(@{ id = 'SMB-04'; area = 'SMB'; sev = 'Medium'; fix = 'review'
+        title = 'Require SMB signing on the client side'
+        why = 'Without signing, an attacker in the network can change what this machine reads from file shares.'
+        ms = 'Microsoft network client: Digitally sign communications (always) = Enabled'
+        impact = 'Shares on servers or NAS boxes that cannot sign can no longer be opened.'
+        items = @(Reg "$Svc\LanmanWorkstation\Parameters" 'RequireSecuritySignature' 1) })
+    $list.Add(@{ id = 'SMB-05'; area = 'SMB'; sev = 'High'; fix = 'safe'
+        title = 'Never send unencrypted passwords to SMB servers'
+        why = 'A rogue SMB server could otherwise ask for the password in clear text.'
+        ms = 'Microsoft network client: Send unencrypted password to third-party SMB servers = Disabled'
+        items = @(Reg "$Svc\LanmanWorkstation\Parameters" 'EnablePlainTextPassword' 0 -Default 0) })
+    $list.Add(@{ id = 'SMB-06'; area = 'SMB'; sev = 'Medium'; fix = 'safe'
+        title = 'Turn off insecure guest logons to SMB servers'
+        why = 'Guest access to shares has no authentication, so a fake server can serve malicious files.'
+        ms = 'Lanman Workstation: Enable insecure guest logons = Disabled'
+        items = @(Reg "$PW\LanmanWorkstation" 'AllowInsecureGuestAuth' 0) })
+    $list.Add(@{ id = 'SMB-07'; area = 'SMB'; sev = 'High'; fix = 'safe'
+        title = 'Block anonymous access to named pipes and shares'
+        why = 'Anonymous (null session) access lets anyone on the network list and open pipes and shares.'
+        ms = 'Network access: Restrict anonymous access to Named Pipes and Shares = Enabled'
+        items = @(Reg "$Svc\LanManServer\Parameters" 'RestrictNullSessAccess' 1 -Default 1) })
+    $list.Add(@{ id = 'SMB-08'; area = 'SMB'; sev = 'Low'; fix = 'review'; minBuild = 26100
+        title = 'Require SMB 3.0 or newer'
+        why = 'SMB 2.x lacks the encryption and integrity protections of SMB 3.'
+        ms = 'Lanman Server / Lanman Workstation: Mandate the minimum version of SMB = SMB 3.0.0'
+        impact = 'Windows 7 / Server 2008 R2 and devices that only speak SMB 2 can no longer connect.'
+        items = @((Reg "$PW\LanmanServer" 'MinSmb2Dialect' 768 -Op 'ge' -Set 768), (Reg "$PW\LanmanWorkstation" 'MinSmb2Dialect' 768 -Op 'ge' -Set 768)) })
+    $list.Add(@{ id = 'SMB-09'; area = 'SMB'; sev = 'Low'; fix = 'safe'; minBuild = 26100
+        title = 'Slow down SMB password guessing'
+        why = 'The authentication rate limiter waits 2 seconds after each failed SMB logon, which makes brute force impractical.'
+        ms = 'Lanman Server: Enable authentication rate limiter = Enabled, delay 2000 ms'
+        items = @((Reg "$PW\LanmanServer" 'EnableAuthRateLimiter' 1), (Reg "$PW\LanmanServer" 'InvalidAuthenticationDelayTimeInMs' 2000 -Op 'ge' -Set 2000)) })
+    $list.Add(@{ id = 'SMB-10'; area = 'SMB'; sev = 'Low'; fix = 'safe'; minBuild = 26100
+        title = 'Log SMB connections without signing, encryption or with guest logon'
+        why = 'The events show which devices would break before you require signing or encryption.'
+        ms = 'Lanman Server / Workstation: Audit client/server does not support encryption, signing; Audit insecure guest logon = Enabled'
+        items = @((Reg "$PW\LanmanServer" 'AuditClientDoesNotSupportEncryption' 1), (Reg "$PW\LanmanServer" 'AuditClientDoesNotSupportSigning' 1),
+                  (Reg "$PW\LanmanServer" 'AuditInsecureGuestLogon' 1), (Reg "$PW\LanmanWorkstation" 'AuditServerDoesNotSupportEncryption' 1),
+                  (Reg "$PW\LanmanWorkstation" 'AuditServerDoesNotSupportSigning' 1), (Reg "$PW\LanmanWorkstation" 'AuditInsecureGuestLogon' 1)) })
+    $list.Add(@{ id = 'SMB-11'; area = 'SMB'; sev = 'Low'; fix = 'safe'; minBuild = 26100
+        title = 'Turn off remote mailslots'
+        why = 'Remote mailslots are a legacy, unauthenticated protocol that is no longer needed.'
+        ms = 'Lanman Server / Workstation: Enable remote mailslots = Disabled'
+        items = @((Reg "$PW\Bowser" 'EnableMailslots' 0), (Reg "$PW\NetworkProvider" 'EnableMailslots' 0)) })
+
+    # --- network ---------------------------------------------------------
+    $list.Add(@{ id = 'NET-01'; area = 'Network'; sev = 'Medium'; fix = 'safe'
+        title = 'Turn off LLMNR (multicast name resolution)'
+        why = 'Attackers answer LLMNR queries to capture password hashes (Responder); DNS is enough.'
+        ms = 'DNS Client: Turn off multicast name resolution = Enabled'
+        impact = 'Names that only work by broadcast, without DNS, stop resolving.'
+        items = @(Reg "$PNT\DNSClient" 'EnableMulticast' 0) })
+    $list.Add(@{ id = 'NET-02'; area = 'Network'; sev = 'Medium'; fix = 'review'; minBuild = 22621
+        title = 'Turn off NetBIOS name resolution'
+        why = 'Like LLMNR, NetBIOS name queries can be answered by an attacker to capture password hashes.'
+        ms = 'DNS Client: Configure NetBIOS settings = Disable NetBIOS name resolution'
+        impact = 'Old devices or applications that find each other only by NetBIOS name stop working.'
+        items = @(Reg "$PNT\DNSClient" 'EnableNetbios' 0) })
+    $list.Add(@{ id = 'NET-03'; area = 'Network'; sev = 'Low'; fix = 'review'; reboot = $true
+        title = 'Use NetBIOS point-to-point mode (no broadcasts)'
+        why = 'P-node asks only the WINS server, never the whole network, so broadcasts cannot be answered by an attacker.'
+        ms = 'MS Security Guide: NetBT NodeType configuration = P-node'
+        impact = 'NetBIOS names resolve only through WINS.'
+        items = @(Reg "$Svc\NetBT\Parameters" 'NodeType' 2) })
+    $list.Add(@{ id = 'NET-04'; area = 'Network'; sev = 'Low'; fix = 'safe'
+        title = 'Ignore NetBIOS name release requests'
+        why = 'Stops other machines from making this one give up its NetBIOS name.'
+        ms = 'MSS: (NoNameReleaseOnDemand) = Enabled'
+        items = @(Reg "$Svc\NetBT\Parameters" 'NoNameReleaseOnDemand' 1) })
+    $list.Add(@{ id = 'NET-05'; area = 'Network'; sev = 'Low'; fix = 'safe'
+        title = 'Turn off IP source routing'
+        why = 'Source-routed packets let a sender choose the path through the network, around firewalls.'
+        ms = 'MSS: (DisableIPSourceRouting) and (DisableIPSourceRouting IPv6) = Highest protection'
+        items = @((Reg "$Svc\Tcpip\Parameters" 'DisableIPSourceRouting' 2), (Reg "$Svc\Tcpip6\Parameters" 'DisableIPSourceRouting' 2)) })
+    $list.Add(@{ id = 'NET-06'; area = 'Network'; sev = 'Low'; fix = 'safe'
+        title = 'Ignore ICMP redirects'
+        why = 'ICMP redirects can be used to send this machine''s traffic through an attacker.'
+        ms = 'MSS: (EnableICMPRedirect) = Disabled'
+        items = @(Reg "$Svc\Tcpip\Parameters" 'EnableICMPRedirect' 0) })
+    $list.Add(@{ id = 'NET-07'; area = 'Network'; sev = 'Medium'; fix = 'safe'; scope = @('domain')
+        title = 'Harden the SYSVOL and NETLOGON paths'
+        why = 'Requires mutual authentication and integrity when Group Policy scripts are read, so they cannot be swapped on the way (MS15-011).'
+        ms = 'Network Provider: Hardened UNC Paths = \\*\SYSVOL and \\*\NETLOGON: RequireMutualAuthentication=1, RequireIntegrity=1'
+        items = @((Reg "$PW\NetworkProvider\HardenedPaths" '\\*\SYSVOL' 'RequireMutualAuthentication=1,RequireIntegrity=1' -Type 'String'),
+                  (Reg "$PW\NetworkProvider\HardenedPaths" '\\*\NETLOGON' 'RequireMutualAuthentication=1,RequireIntegrity=1' -Type 'String')) })
+    $list.Add(@{ id = 'NET-08'; area = 'Network'; sev = 'Medium'; fix = 'safe'
+        title = 'Sign LDAP requests'
+        why = 'Unsigned LDAP traffic to domain controllers can be changed or relayed.'
+        ms = 'Network security: LDAP client signing requirements = Negotiate signing'
+        items = @(Reg "$Svc\LDAP" 'LDAPClientIntegrity' 1 -Op 'ge' -Default 1 -Set 1) })
+    $list.Add(@{ id = 'NET-09'; area = 'Network'; sev = 'Medium'; fix = 'review'; scope = @('notdc')
+        title = 'Allow only authenticated RPC clients'
+        why = 'Anonymous RPC calls are a common way to probe and attack Windows services.'
+        ms = 'Remote Procedure Call: Restrict Unauthenticated RPC clients = Authenticated'
+        impact = 'Old software that calls RPC services anonymously stops working.'
+        items = @(Reg "$PNT\Rpc" 'RestrictRemoteClients' 1) })
+
+    # --- credentials and LSA ---------------------------------------------
+    $list.Add(@{ id = 'LSA-01'; area = 'Credentials'; sev = 'High'; fix = 'safe'
+        title = 'Do not keep plain-text passwords in memory (WDigest)'
+        why = 'With WDigest on, tools like Mimikatz read logged-on users'' passwords in clear text from LSASS.'
+        ms = 'MS Security Guide: WDigest Authentication = Disabled (Windows Server 2022 baseline)'
+        items = @(Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0 -Default 0) })
+    $list.Add(@{ id = 'LSA-02'; area = 'Credentials'; sev = 'High'; fix = 'safe'
+        title = 'Do not store LAN Manager password hashes'
+        why = 'LM hashes are cracked in seconds.'
+        ms = 'Network security: Do not store LAN Manager hash value on next password change = Enabled (Windows Server 2022 baseline)'
+        items = @(Reg $Lsa 'NoLMHash' 1 -Default 1) })
+    $list.Add(@{ id = 'LSA-03'; area = 'Credentials'; sev = 'Medium'; fix = 'review'
+        title = 'Allow only NTLMv2 authentication (refuse LM and NTLMv1)'
+        why = 'LM and NTLMv1 responses can be cracked or relayed easily.'
+        ms = 'Network security: LAN Manager authentication level = Send NTLMv2 response only. Refuse LM & NTLM'
+        impact = 'Very old clients, appliances or applications that only speak NTLMv1 can no longer log on.'
+        items = @(Reg $Lsa 'LmCompatibilityLevel' 5 -Default 3) })
+    $list.Add(@{ id = 'LSA-04'; area = 'Credentials'; sev = 'Medium'; fix = 'review'
+        title = 'Require NTLMv2 session security and 128-bit encryption'
+        why = 'Weaker NTLM sessions can be downgraded and read.'
+        ms = 'Network security: Minimum session security for NTLM SSP based clients / servers = Require NTLMv2 session security, Require 128-bit encryption'
+        impact = 'Old applications that use weak NTLM sessions stop working.'
+        items = @((Reg $Msv 'NTLMMinClientSec' 537395200 -Default 536870912), (Reg $Msv 'NTLMMinServerSec' 537395200 -Default 536870912)) })
+    $list.Add(@{ id = 'LSA-05'; area = 'Credentials'; sev = 'Medium'; fix = 'safe'
+        title = 'Block anonymous listing of accounts and shares'
+        why = 'Anonymous users can otherwise list user names and shares, which helps password guessing.'
+        ms = 'Network access: Do not allow anonymous enumeration of SAM accounts (and shares) = Enabled'
+        items = @((Reg $Lsa 'RestrictAnonymousSAM' 1 -Default 1), (Reg $Lsa 'RestrictAnonymous' 1 -Default 0)) })
+    $list.Add(@{ id = 'LSA-06'; area = 'Credentials'; sev = 'Medium'; fix = 'safe'; scope = @('notdc')
+        title = 'Allow only administrators to query local accounts remotely'
+        why = 'Stops normal domain users from listing local users and groups (used by BloodHound and similar tools).'
+        ms = 'Network access: Restrict clients allowed to make remote calls to SAM = Administrators only'
+        items = @(Reg $Lsa 'RestrictRemoteSAM' 'O:BAG:BAD:(A;;RC;;;BA)' -Type 'String' -Default $(if ($old) { $null } else { 'O:BAG:BAD:(A;;RC;;;BA)' })) })
+    $list.Add(@{ id = 'LSA-07'; area = 'Credentials'; sev = 'Low'; fix = 'safe'
+        title = 'Turn off NULL session fallback for LocalSystem'
+        why = 'Prevents services running as LocalSystem from falling back to unauthenticated sessions.'
+        ms = 'Network security: Allow LocalSystem NULL session fallback = Disabled'
+        items = @(Reg $Msv 'allownullsessionfallback' 0 -Default 0) })
+    $list.Add(@{ id = 'LSA-08'; area = 'Credentials'; sev = 'High'; fix = 'safe'
+        title = 'Allow blank passwords only at the console'
+        why = 'Local accounts with an empty password must never be usable over the network.'
+        ms = 'Accounts: Limit local account use of blank passwords to console logon only = Enabled'
+        items = @(Reg $Lsa 'LimitBlankPasswordUse' 1 -Default 1) })
+    $list.Add(@{ id = 'LSA-09'; area = 'Credentials'; sev = 'Medium'; fix = 'review'; reboot = $true; match = 'any'
+        title = 'Run LSASS as a protected process (LSA protection)'
+        why = 'Protects the process that holds credentials against memory dumping and code injection.'
+        ms = 'Local Security Authority: Configures LSASS to run as a protected process = Enabled'
+        impact = 'Third-party LSA plug-ins (some smart card, password filter or security products) that are not signed by Microsoft no longer load. Applied without UEFI lock, so it can be undone.'
+        items = @((Reg $Lsa 'RunAsPPL' @(1, 2) -Op 'in' -Set 2), (Reg "$PW\System" 'RunAsPPL' @(1, 2) -Op 'in')) })
+    $list.Add(@{ id = 'LSA-10'; area = 'Credentials'; sev = 'Low'; fix = 'safe'
+        title = 'Use Remote Credential Guard / Restricted Admin for credential delegation'
+        why = 'The remote host gets no reusable copy of your credentials when you connect with RDP.'
+        ms = 'Credentials Delegation: Remote host allows delegation of non-exportable credentials = Enabled'
+        items = @(Reg "$PW\CredentialsDelegation" 'AllowProtectedCreds' 1) })
+    $list.Add(@{ id = 'LSA-11'; area = 'Credentials'; sev = 'Medium'; fix = 'safe'
+        title = 'Connect only to patched CredSSP servers'
+        why = 'Protects RDP and WinRM logons against the CredSSP encryption oracle attack (CVE-2018-0886).'
+        ms = 'Credentials Delegation: Encryption Oracle Remediation = Force Updated Clients'
+        items = @(Reg "$SysP\CredSSP\Parameters" 'AllowEncryptionOracle' 0) })
+    $list.Add(@{ id = 'LSA-12'; area = 'Credentials'; sev = 'Low'; fix = 'safe'; scope = @('server')
+        title = 'Log NTLM usage'
+        why = 'Shows where NTLM is still used, so it can be reduced before it is blocked.'
+        ms = 'Network security: Restrict NTLM: Audit Incoming NTLM Traffic = all accounts; Outgoing NTLM traffic to remote servers = Audit all'
+        items = @((Reg $Msv 'AuditReceivingNTLMTraffic' 2), (Reg $Msv 'RestrictSendingNTLMTraffic' 1 -Op 'ge' -Set 1)) })
+    $list.Add(@{ id = 'LSA-13'; area = 'Credentials'; sev = 'Low'; fix = 'manual'; kind = 'custom'; scope = @('notdc')
+        title = 'Turn on Credential Guard'
+        why = 'Credential Guard keeps NTLM hashes and Kerberos tickets in an isolated, virtualization-protected process.'
+        ms = 'Device Guard: Turn On Virtualization Based Security, Credential Guard = Enabled with UEFI lock (Credential Guard baseline GPO)'
+        how = 'Needs UEFI, Secure Boot, TPM and virtualization support (on a VM: nested virtualization). Turn it on with the Microsoft baseline Credential Guard GPO or the Device Guard readiness tool, then restart.'
+        get = { param($C, $Ctx)
+            $run = @()
+            try { $run = @((Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard).SecurityServicesRunning) } catch { }
+            $ok = $run -contains 1
+            @{ ok = $ok; state = $null; items = @(New-CheckItem 'Device Guard: Credential Guard' 'running' $(if ($ok) { 'running' } else { 'not running' }) $ok) } } })
+
+    # --- accounts and UAC ------------------------------------------------
+    $list.Add(@{ id = 'UAC-01'; area = 'Accounts'; sev = 'High'; fix = 'review'; reboot = $true
+        title = 'Keep User Account Control on'
+        why = 'Without UAC every program an administrator starts runs with full rights.'
+        ms = 'User Account Control: Run all administrators in Admin Approval Mode = Enabled'
+        impact = 'Programs that expect full administrator rights without a prompt need "Run as administrator".'
+        items = @(Reg $SysP 'EnableLUA' 1 -Default 1) })
+    $list.Add(@{ id = 'UAC-02'; area = 'Accounts'; sev = 'Low'; fix = 'review'
+        title = 'Ask administrators for consent on the secure desktop'
+        why = 'The default prompt can be skipped by some auto-elevation tricks; the secure desktop cannot be clicked by malware.'
+        ms = 'User Account Control: Behavior of the elevation prompt for administrators in Admin Approval Mode = Prompt for consent on the secure desktop'
+        impact = 'Administrators see a consent prompt for every elevation.'
+        items = @(Reg $SysP 'ConsentPromptBehaviorAdmin' 2 -Default 5) })
+    $list.Add(@{ id = 'UAC-03'; area = 'Accounts'; sev = 'Low'; fix = 'review'
+        title = 'Deny elevation requests from standard users'
+        why = 'Standard users should not be asked for administrator passwords (a common phishing trick).'
+        ms = 'User Account Control: Behavior of the elevation prompt for standard users = Automatically deny elevation requests'
+        impact = 'Standard users must log on as an administrator (or use Run as) to install software.'
+        items = @(Reg $SysP 'ConsentPromptBehaviorUser' 0 -Default 3) })
+    $list.Add(@{ id = 'UAC-04'; area = 'Accounts'; sev = 'Medium'; fix = 'review'
+        title = 'Use Admin Approval Mode for the built-in Administrator'
+        why = 'Otherwise the built-in Administrator runs everything with full rights, without UAC.'
+        ms = 'User Account Control: Admin Approval Mode for the Built-in Administrator account = Enabled'
+        impact = 'Scripts and tools run as the built-in Administrator must be elevated like for other admins.'
+        items = @(Reg $SysP 'FilterAdministratorToken' 1 -Default 0) })
+    $list.Add(@{ id = 'UAC-05'; area = 'Accounts'; sev = 'Low'; fix = 'safe'
+        title = 'Keep the remaining User Account Control protections on'
+        why = 'Installer detection, secure UIAccess paths and file/registry virtualization are part of UAC''s protection.'
+        ms = 'User Account Control: Detect application installations; Only elevate UIAccess applications in secure locations; Virtualize file and registry write failures = Enabled'
+        items = @((Reg $SysP 'EnableInstallerDetection' 1), (Reg $SysP 'EnableSecureUIAPaths' 1 -Default 1), (Reg $SysP 'EnableVirtualization' 1 -Default 1)) })
+    $list.Add(@{ id = 'UAC-06'; area = 'Accounts'; sev = 'Medium'; fix = 'safe'; scope = @('member')
+        title = 'Apply UAC to local accounts on network logons'
+        why = 'Stops a stolen local administrator password or hash from being used to take over other machines (pass-the-hash).'
+        ms = 'MS Security Guide: Apply UAC restrictions to local accounts on network logons = Enabled'
+        impact = 'Remote administration with a local account (not a domain account) gets only standard rights.'
+        items = @(Reg $SysP 'LocalAccountTokenFilterPolicy' 0 -Default 0) })
+    $list.Add(@{ id = 'ACC-01'; area = 'Accounts'; sev = 'Medium'; fix = 'review'; kind = 'sec'; scope = @('notdc')
+        title = 'Require passwords of at least 14 characters'
+        why = 'Short passwords are guessed or cracked quickly. On a domain member this applies to local accounts; domain accounts follow the domain policy.'
+        ms = 'Password Policy: Minimum password length = 14'
+        impact = 'Users have to choose a longer password at the next change.'
+        items = @(Sec $SA 'MinimumPasswordLength' 'Minimum password length' 14 -Op 'ge') })
+    $list.Add(@{ id = 'ACC-02'; area = 'Accounts'; sev = 'Medium'; fix = 'safe'; kind = 'sec'; scope = @('notdc')
+        title = 'Require complex passwords'
+        why = 'Complexity rules stop the most common, easily guessed passwords.'
+        ms = 'Password Policy: Password must meet complexity requirements = Enabled'
+        items = @(Sec $SA 'PasswordComplexity' 'Password must meet complexity requirements' 1) })
+    $list.Add(@{ id = 'ACC-03'; area = 'Accounts'; sev = 'Low'; fix = 'safe'; kind = 'sec'; scope = @('notdc')
+        title = 'Remember the last 24 passwords'
+        why = 'Stops users from switching back to a previous (possibly leaked) password.'
+        ms = 'Password Policy: Enforce password history = 24'
+        items = @(Sec $SA 'PasswordHistorySize' 'Enforce password history' 24 -Op 'ge') })
+    $list.Add(@{ id = 'ACC-04'; area = 'Accounts'; sev = 'High'; fix = 'safe'; kind = 'sec'; scope = @('notdc')
+        title = 'Do not store passwords with reversible encryption'
+        why = 'Reversibly encrypted passwords are as good as plain text.'
+        ms = 'Password Policy: Store passwords using reversible encryption = Disabled'
+        items = @(Sec $SA 'ClearTextPassword' 'Store passwords using reversible encryption' 0) })
+    $lock = if ($srv) { 3 } else { 10 }
+    $list.Add(@{ id = 'ACC-05'; area = 'Accounts'; sev = 'Medium'; fix = 'review'; kind = 'sec'; scope = @('notdc')
+        title = "Lock accounts after $lock wrong passwords"
+        why = 'Without a lockout, local passwords can be guessed without limit.'
+        ms = "Account Lockout: Account lockout threshold = $lock"
+        impact = 'Users (and service accounts with an old password) get locked out after repeated wrong passwords.'
+        items = @(Sec $SA 'LockoutBadCount' 'Account lockout threshold' @(1, $lock) -Op 'range' -Set $lock) })
+    $dur = if ($srv) { 15 } else { 10 }
+    $list.Add(@{ id = 'ACC-06'; area = 'Accounts'; sev = 'Low'; fix = 'safe'; kind = 'sec'; scope = @('notdc')
+        title = "Keep locked accounts locked for $dur minutes"
+        why = 'A short lockout lets an attacker keep guessing.'
+        ms = "Account Lockout: Account lockout duration = $dur; Reset account lockout counter after = $dur"
+        items = @((Sec $SA 'LockoutDuration' 'Account lockout duration (minutes)' $dur -Op 'minutes' -Set $dur),
+                  (Sec $SA 'ResetLockoutCount' 'Reset account lockout counter after (minutes)' $dur -Op 'ge' -Set $dur)) })
+    $list.Add(@{ id = 'ACC-07'; area = 'Accounts'; sev = 'Low'; fix = 'safe'; kind = 'sec'; scope = @('notdc'); minBuild = 20348
+        title = 'Let the Administrator account be locked out too'
+        why = 'Otherwise the built-in Administrator can be guessed without limit.'
+        ms = 'Account Lockout: Allow Administrator account lockout = Enabled'
+        items = @(Sec $SA 'AllowAdministratorLockout' 'Allow Administrator account lockout' 1) })
+    $list.Add(@{ id = 'ACC-08'; area = 'Accounts'; sev = 'Medium'; fix = 'safe'; kind = 'sec'; scope = @('notdc')
+        title = 'Keep the Guest account disabled'
+        why = 'The Guest account allows logons without a password.'
+        ms = 'Accounts: Guest account status = Disabled (Windows default)'
+        items = @(Sec $SA 'EnableGuestAccount' 'Guest account status' 0) })
+    $list.Add(@{ id = 'ACC-09'; area = 'Accounts'; sev = 'Medium'; fix = 'safe'; kind = 'sec'
+        title = 'Block anonymous SID / name translation'
+        why = 'Anonymous users could otherwise find the real name of the Administrator account.'
+        ms = 'Network access: Allow anonymous SID/Name translation = Disabled'
+        items = @(Sec $SA 'LSAAnonymousNameLookup' 'Allow anonymous SID/Name translation' 0) })
+    $list.Add(@{ id = 'ACC-10'; area = 'Accounts'; sev = 'Low'; fix = 'safe'
+        title = 'Lock idle sessions after 15 minutes'
+        why = 'An unattended, unlocked session can be used by anyone at the console or in RDP.'
+        ms = 'Interactive logon: Machine inactivity limit = 900 seconds'
+        items = @(Reg $SysP 'InactivityTimeoutSecs' @(1, 900) -Op 'range' -Set 900) })
+    $list.Add(@{ id = 'ACC-11'; area = 'Accounts'; sev = 'Low'; fix = 'safe'
+        title = 'Do not sign in the last user automatically after a restart'
+        why = 'Automatic restart sign-on keeps the user''s credentials so Windows can log on by itself.'
+        ms = 'Windows Logon Options: Sign-in and lock last interactive user automatically after a restart = Disabled'
+        items = @(Reg $SysP 'DisableAutomaticRestartSignOn' 1) })
+    $list.Add(@{ id = 'ACC-12'; area = 'Accounts'; sev = 'High'; fix = 'manual'
+        title = 'Remove the auto-logon password from the registry'
+        why = 'With auto-logon, the password is stored in clear text in the registry (Winlogon DefaultPassword), readable by every administrator and by malware.'
+        ms = 'Microsoft guidance: do not use auto-logon with a stored password'
+        how = 'Turn auto-logon off (netplwiz, or delete DefaultPassword and set AutoAdminLogon to 0 under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon), then change that account''s password. For kiosks, use Sysinternals Autologon, which stores the password encrypted.'
+        items = @(Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'DefaultPassword' $null -Op 'absent') })
+    $list.Add(@{ id = 'ACC-13'; area = 'Accounts'; sev = 'Medium'; fix = 'manual'; match = 'any'; scope = @('member')
+        title = 'Manage the local Administrator password with LAPS'
+        why = 'Without LAPS the local Administrator password is often the same on many machines, so one stolen hash opens them all.'
+        ms = 'LAPS: Configure password backup directory = Active Directory (Windows 11 baseline)'
+        how = 'Turn on Windows LAPS (built into Windows since April 2023) with Group Policy: Computer Configuration > Administrative Templates > System > LAPS, "Configure password backup directory" = Active Directory, after running Update-LapsADSchema once.'
+        items = @((Reg 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS' 'BackupDirectory' @(1, 2) -Op 'in'),
+                  (Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS' 'BackupDirectory' @(1, 2) -Op 'in'),
+                  (Reg "$Pol Services\AdmPwd" 'AdmPwdEnabled' 1)) })
+    $list.Add(@{ id = 'ACC-14'; area = 'Accounts'; sev = 'Low'; fix = 'safe'
+        title = 'Lock the session when the smart card is removed'
+        why = 'Users who pull their smart card expect the session to lock.'
+        ms = 'Interactive logon: Smart card removal behavior = Lock Workstation'
+        items = @(Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'ScRemoveOption' '1' -Type 'String') })
+
+    # --- user rights (local security policy) ------------------------------
+    $rights = @(
+        @('URA-01', 'High',   'SeTcbPrivilege',                   'Act as part of the operating system', @(), 'only', 'This right lets a process become any user.', 'safe'),
+        @('URA-02', 'High',   'SeCreateTokenPrivilege',           'Create a token object', @(), 'only', 'This right lets a process create any access token, with any rights.', 'safe'),
+        @('URA-03', 'Medium', 'SeTrustedCredManAccessPrivilege',  'Access Credential Manager as a trusted caller', @(), 'only', 'This right gives access to all saved credentials.', 'safe'),
+        @('URA-04', 'Medium', 'SeDebugPrivilege',                 'Debug programs', @($Admins), 'only', 'Debug rights are enough to read passwords from LSASS.', 'review'),
+        @('URA-05', 'Medium', 'SeLoadDriverPrivilege',            'Load and unload device drivers', @($Admins), 'only', 'A driver runs in the kernel, so this right equals full control.', 'review'),
+        @('URA-06', 'Medium', 'SeTakeOwnershipPrivilege',         'Take ownership of files or other objects', @($Admins), 'only', 'Ownership allows changing the permissions of any file.', 'review'),
+        @('URA-07', 'Medium', 'SeSecurityPrivilege',              'Manage auditing and security log', @($Admins), 'only', 'This right allows clearing the Security event log.', 'review'),
+        @('URA-08', 'Low',    'SeBackupPrivilege',                'Back up files and directories', @($Admins), 'only', 'Backup rights read every file, including the SAM and NTDS databases.', 'review'),
+        @('URA-09', 'Low',    'SeRestorePrivilege',               'Restore files and directories', @($Admins), 'only', 'Restore rights overwrite any file, including system files.', 'review'),
+        @('URA-10', 'Low',    'SeSystemEnvironmentPrivilege',     'Modify firmware environment values', @($Admins), 'only', 'Firmware settings can turn off Secure Boot protections.', 'review'),
+        @('URA-11', 'Low',    'SeLockMemoryPrivilege',            'Lock pages in memory', @(), 'only', 'Locked memory pages cannot be paged out, which can starve the system.', 'review'),
+        @('URA-12', 'Low',    'SeCreatePermanentPrivilege',       'Create permanent shared objects', @(), 'only', 'Permanent objects outlive the process that created them.', 'safe')
+    )
+    if (-not $H.dc) { $rights += , @('URA-13', 'Medium', 'SeEnableDelegationPrivilege', 'Enable computer and user accounts to be trusted for delegation', @(), 'only', 'Delegation lets a service act as any user who connects to it.', 'safe') }
+    foreach ($r in $rights) {
+        $list.Add(@{ id = $r[0]; area = 'User rights'; sev = $r[1]; fix = $r[7]; kind = 'sec'; scope = @('notdc')
+            title = $(if ($r[4].Count) { "Give `"$($r[3])`" only to Administrators" } else { "Give `"$($r[3])`" to no one" })
+            why = $r[6]
+            ms = "User Rights Assignment: $($r[3]) = $(if ($r[4].Count) { 'Administrators' } else { 'No One' })"
+            impact = $(if ($r[7] -eq 'review') { 'Backup, monitoring or database software (for example SQL Server with "Lock pages in memory") may have been given this right on purpose: check its service account before removing it.' } else { $null })
+            items = @(Sec $PR $r[2] $r[3] $r[4] -Op $r[5]) })
+    }
+    $denyNet = if ($srv) { @('*S-1-5-114', '*S-1-5-32-546') } else { @('*S-1-5-113') }
+    $list.Add(@{ id = 'URA-14'; area = 'User rights'; sev = 'Medium'; fix = 'review'; kind = 'sec'; scope = @('member')
+        title = 'Deny network logon to local administrator accounts'
+        why = 'Local administrator passwords are often reused; blocking them over the network stops lateral movement with a stolen hash.'
+        ms = 'User Rights Assignment: Deny access to this computer from the network = ' + $(if ($srv) { 'Guests, Local account and member of Administrators group' } else { 'Local account' })
+        impact = 'Remote administration with local accounts stops working; use domain accounts.'
+        items = @(Sec $PR 'SeDenyNetworkLogonRight' 'Deny access to this computer from the network' $denyNet -Op 'has') })
+    $list.Add(@{ id = 'URA-15'; area = 'User rights'; sev = 'Medium'; fix = 'review'; kind = 'sec'; scope = @('member')
+        title = 'Deny Remote Desktop logon to local administrator accounts'
+        why = 'Forces Remote Desktop logons to use domain accounts, which are audited and can be disabled centrally.'
+        ms = 'User Rights Assignment: Deny log on through Remote Desktop Services = ' + $(if ($srv) { 'Guests, Local account and member of Administrators group' } else { 'Local account' })
+        impact = 'Remote Desktop with local accounts stops working; keep console access or a domain admin account.'
+        items = @(Sec $PR 'SeDenyRemoteInteractiveLogonRight' 'Deny log on through Remote Desktop Services' $denyNet -Op 'has') })
+    $netAllow = if ($srv) { @($Admins, '*S-1-5-11') } else { @($Admins, '*S-1-5-32-555') }
+    $list.Add(@{ id = 'URA-16'; area = 'User rights'; sev = 'Low'; fix = 'review'; kind = 'sec'; scope = @('notdc')
+        title = 'Limit who can access this computer from the network'
+        why = 'The default also includes Everyone, Users and Backup Operators.'
+        ms = 'User Rights Assignment: Access this computer from the network = ' + $(if ($srv) { 'Administrators, Authenticated Users' } else { 'Administrators, Remote Desktop Users' })
+        impact = 'Accounts not in these groups can no longer open shares or other network services on this machine.'
+        items = @(Sec $PR 'SeNetworkLogonRight' 'Access this computer from the network' $netAllow -Op 'only') })
+    $localAllow = if ($srv) { @($Admins) } else { @($Admins, '*S-1-5-32-545') }
+    $list.Add(@{ id = 'URA-17'; area = 'User rights'; sev = 'Low'; fix = 'review'; kind = 'sec'; scope = @('notdc')
+        title = 'Limit who can log on at the console'
+        why = 'On servers only administrators should log on locally.'
+        ms = 'User Rights Assignment: Allow log on locally = ' + $(if ($srv) { 'Administrators' } else { 'Administrators, Users' })
+        impact = 'Other accounts (for example Backup Operators or kiosk users) can no longer log on at the console.'
+        items = @(Sec $PR 'SeInteractiveLogonRight' 'Allow log on locally' $localAllow -Op 'only') })
+
+    # --- audit policy and logging ----------------------------------------
+    $g = '-69ae-11d9-bed3-505054503030}'
+    $audit = @(
+        @('AUD-01', 'Credential Validation', '{0cce923f', 3, 'Medium'),
+        @('AUD-02', 'Security Group Management', '{0cce9237', 1, 'Low'),
+        @('AUD-03', 'User Account Management', '{0cce9235', 3, 'Medium'),
+        @('AUD-04', 'PNP Activity', '{0cce9248', 1, 'Low'),
+        @('AUD-05', 'Process Creation', '{0cce922b', 1, 'Medium'),
+        @('AUD-06', 'Account Lockout', '{0cce9217', 2, 'Low'),
+        @('AUD-07', 'Group Membership', '{0cce9249', 1, 'Low'),
+        @('AUD-08', 'Logon', '{0cce9215', 3, 'Medium'),
+        @('AUD-09', 'Other Logon/Logoff Events', '{0cce921c', 3, 'Low'),
+        @('AUD-10', 'Special Logon', '{0cce921b', 1, 'Low'),
+        @('AUD-11', 'Detailed File Share', '{0cce9244', 2, 'Low'),
+        @('AUD-12', 'File Share', '{0cce9224', 3, 'Low'),
+        @('AUD-13', 'Other Object Access Events', '{0cce9227', 3, 'Low'),
+        @('AUD-14', 'Removable Storage', '{0cce9245', 3, 'Low'),
+        @('AUD-15', 'Audit Policy Change', '{0cce922f', $(if ($srv) { 3 } else { 1 }), 'Medium'),
+        @('AUD-16', 'Authentication Policy Change', '{0cce9230', 1, 'Low'),
+        @('AUD-17', 'MPSSVC Rule-Level Policy Change', '{0cce9232', 3, 'Low'),
+        @('AUD-18', 'Other Policy Change Events', '{0cce9234', 2, 'Low'),
+        @('AUD-19', 'Sensitive Privilege Use', '{0cce9228', $(if ($srv) { 3 } else { 1 }), 'Low'),
+        @('AUD-20', 'Other System Events', '{0cce9214', 3, 'Low'),
+        @('AUD-21', 'Security State Change', '{0cce9210', 1, 'Low'),
+        @('AUD-22', 'Security System Extension', '{0cce9211', 1, 'Low'),
+        @('AUD-23', 'System Integrity', '{0cce9212', 3, 'Low')
+    )
+    if ($srv) { $audit += , @('AUD-24', 'Authorization Policy Change', '{0cce9231', 1, 'Low') }
+    if ($H.dc) {
+        $audit += @(
+            @('AUD-25', 'Kerberos Authentication Service', '{0cce9242', 3, 'Medium'),
+            @('AUD-26', 'Kerberos Service Ticket Operations', '{0cce9240', 2, 'Low'),
+            @('AUD-27', 'Computer Account Management', '{0cce9236', 1, 'Low'),
+            @('AUD-28', 'Other Account Management Events', '{0cce923a', 1, 'Low'),
+            @('AUD-29', 'Directory Service Access', '{0cce923b', 2, 'Low'),
+            @('AUD-30', 'Directory Service Changes', '{0cce923c', 1, 'Medium')
+        )
+    }
+    foreach ($a in $audit) {
+        $list.Add(@{ id = $a[0]; area = 'Audit'; sev = $a[4]; fix = 'safe'; kind = 'audit'
+            title = "Audit $($a[1]): $(Format-Audit $a[3])"
+            why = 'Without these events, attacks and their traces cannot be found in the Security log or your SIEM.'
+            ms = "Advanced Audit Policy: Audit $($a[1]) = $(Format-Audit $a[3])"
+            sub = $a[1]; guid = $a[2] + $g; want = [int]$a[3] })
+    }
+    $list.Add(@{ id = 'AUD-40'; area = 'Audit'; sev = 'Low'; fix = 'safe'
+        title = 'Use the advanced audit policy (subcategories)'
+        why = 'Without this, old category settings can silently override the detailed audit policy.'
+        ms = 'Audit: Force audit policy subcategory settings to override audit policy category settings = Enabled'
+        items = @(Reg $Lsa 'SCENoApplyLegacyAuditPolicy' 1) })
+    $list.Add(@{ id = 'AUD-41'; area = 'Audit'; sev = 'Low'; fix = 'safe'
+        title = 'Include the command line in process creation events'
+        why = 'The command line (event 4688) shows what a process was told to do, for example an encoded PowerShell command.'
+        ms = 'Audit Process Creation: Include command line in process creation events = Enabled'
+        items = @(Reg "$SysP\Audit" 'ProcessCreationIncludeCmdLine_Enabled' 1) })
+    $list.Add(@{ id = 'AUD-42'; area = 'Audit'; sev = 'Medium'; fix = 'safe'
+        title = 'Turn on PowerShell script block logging'
+        why = 'Logs the PowerShell code that runs (event 4104), including de-obfuscated malicious scripts.'
+        ms = 'Windows PowerShell: Turn on PowerShell Script Block Logging = Enabled'
+        items = @(Reg "$PW\PowerShell\ScriptBlockLogging" 'EnableScriptBlockLogging' 1) })
+    $list.Add(@{ id = 'AUD-43'; area = 'Audit'; sev = 'Low'; fix = 'safe'; kind = 'custom'
+        title = 'Make the event logs large enough'
+        why = 'Small logs overwrite the evidence within hours on a busy server.'
+        ms = 'Event Log Service: Specify the maximum log file size = Application 32768 KB, Security 196608 KB, System 32768 KB'
+        logs = [ordered]@{ Application = 32768; Security = 196608; System = 32768 }
+        get = { param($C, $Ctx)
+            $items = @(); $st = @{}
+            foreach ($l in $C.logs.Keys) {
+                $cur = [long](Get-WinEvent -ListLog $l).MaximumSizeInBytes
+                $st[$l] = $cur
+                $items += New-CheckItem ('{0} log: maximum size' -f $l) ('>= {0} KB' -f $C.logs[$l]) ('{0} KB' -f [long]($cur / 1KB)) ($cur -ge $C.logs[$l] * 1KB)
+            }
+            @{ ok = (@($items | Where-Object { -not $_.ok }).Count -eq 0); items = $items; state = $st } }
+        set = { param($C, $S)
+            foreach ($l in $C.logs.Keys) {
+                if ([long]$S.$l -lt $C.logs[$l] * 1KB) {
+                    $out = & wevtutil.exe sl $l "/ms:$($C.logs[$l] * 1KB)" 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw "wevtutil $l failed: $out" }
+                }
+            } }
+        restore = { param($C, $S) foreach ($l in $C.logs.Keys) { if ($S.$l) { & wevtutil.exe sl $l "/ms:$($S.$l)" | Out-Null } } } })
+
+    # --- Microsoft Defender ----------------------------------------------
+    $list.Add(@{ id = 'DEF-01'; area = 'Defender'; sev = 'Medium'; fix = 'manual'; kind = 'custom'
+        title = 'Run Microsoft Defender Antivirus (or another antivirus)'
+        why = 'The Defender checks of the baseline apply only when Defender is the active antivirus.'
+        ms = 'Microsoft Defender Antivirus baseline GPO'
+        how = 'Turn Microsoft Defender Antivirus on (on servers: Install-WindowsFeature Windows-Defender). If another antivirus protects this machine, add DEF-01 to hardening_exclude in the config.'
+        get = { param($C, $Ctx)
+            @{ ok = $Ctx.defender; state = $null; items = @(New-CheckItem 'Microsoft Defender Antivirus' 'active (normal mode)' $Ctx.mpMode $Ctx.defender) } } })
+    $mp = @(
+        @('DEF-02', 'High',   'DisableRealtimeMonitoring', $false, $null, 'Keep real-time protection on', 'Turn off real-time protection = Disabled', 'Without real-time protection, malware is only found by scheduled scans, if at all.'),
+        @('DEF-03', 'Medium', 'DisableBehaviorMonitoring', $false, $null, 'Keep behavior monitoring on', 'Turn on behavior monitoring = Enabled', 'Behavior monitoring catches malware by what it does, not only by its signature.'),
+        @('DEF-04', 'Medium', 'DisableIOAVProtection', $false, $null, 'Scan all downloaded files and attachments', 'Scan all downloaded files and attachments = Enabled', 'Downloads are the most common way malware arrives.'),
+        @('DEF-05', 'Medium', 'DisableScriptScanning', $false, $null, 'Scan scripts', 'Turn on script scanning = Enabled', 'Script scanning (AMSI) sees PowerShell, VBScript and JavaScript after de-obfuscation.'),
+        @('DEF-06', 'Medium', 'MAPSReporting', 1, 2, 'Use cloud-delivered protection (MAPS)', 'Join Microsoft MAPS = Advanced MAPS', 'Cloud protection blocks new malware within seconds instead of waiting for the next signature update.'),
+        @('DEF-07', 'Medium', 'DisableBlockAtFirstSeen', $false, $null, 'Turn on Block at First Sight', 'Configure the Block at First Sight feature = Enabled', 'Unknown files are checked in the cloud before they can run.'),
+        @('DEF-08', 'Low',    'SubmitSamplesConsent', @(1, 3), 1, 'Send safe samples for analysis', 'Send file samples when further analysis is required = Send safe samples', 'Needed for Block at First Sight to analyse unknown files.'),
+        @('DEF-09', 'Low',    'CloudBlockLevel', 2, 2, 'Use the high cloud protection level', 'Select cloud protection level = High blocking level', 'Blocks more suspicious unknown files.'),
+        @('DEF-10', 'Medium', 'PUAProtection', 1, 1, 'Block potentially unwanted applications', 'Configure detection for potentially unwanted applications = Block', 'Blocks adware, bundlers and "hacking tools" that often come with malware.'),
+        @('DEF-11', 'Low',    'DisableRemovableDriveScanning', $false, $null, 'Scan removable drives', 'Scan removable drives = Enabled', 'USB drives are still a common way in.')
+    )
+    foreach ($m in $mp) {
+        $op = if ($m[3] -is [array]) { 'in' } elseif ($m[3] -is [bool]) { 'eq' } else { 'ge' }
+        $list.Add(@{ id = $m[0]; area = 'Defender'; sev = $m[1]; fix = 'safe'; kind = 'mp'; scope = @('defender')
+            pref = $m[2]; want = $m[3]; op = $op; set = $m[4]
+            title = $m[5]; why = $m[7]; ms = "Microsoft Defender Antivirus: $($m[6])" })
+    }
+    $list.Add(@{ id = 'DEF-12'; area = 'Defender'; sev = 'Medium'; fix = 'review'; kind = 'mp'; scope = @('defender', 'client')
+        pref = 'EnableNetworkProtection'; want = 1; op = 'eq'
+        title = 'Turn on network protection'
+        why = 'Blocks connections to known phishing, malware and command-and-control sites from every program.'
+        ms = 'Microsoft Defender Exploit Guard: Prevent users and apps from accessing dangerous websites = Block'
+        impact = 'Connections to sites Microsoft rates as dangerous are blocked for all programs.' })
+    $asr = @(
+        @('9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2', 'Block credential stealing from LSASS', 'Medium', 'all'),
+        @('56a863a9-875e-4185-98a7-b882c64b5ce5', 'Block abuse of exploited vulnerable signed drivers', 'Medium', 'all'),
+        @('c1db55ab-c21a-4637-bb3f-a12568109d35', 'Use advanced protection against ransomware', 'Medium', 'all'),
+        @('e6db77e5-3df2-4cf1-b95a-636979351e5b', 'Block persistence through WMI event subscription', 'Low', 'all'),
+        @('5beb7efe-fd9a-4556-801d-275e5ffc04cc', 'Block execution of potentially obfuscated scripts', 'Low', 'all'),
+        @('d3e037e1-3eb8-44c8-a917-57927947596d', 'Block JavaScript or VBScript from launching downloaded executable content', 'Low', 'all'),
+        @('b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4', 'Block untrusted and unsigned processes that run from USB', 'Low', 'all'),
+        @('a8f5898e-1dc8-49a9-9878-85004b8a61e6', 'Block web shell creation for servers', 'Medium', 'server'),
+        @('be9ba2d9-53ea-4cdc-84e5-9b1eeee46550', 'Block executable content from email client and webmail', 'Medium', 'client'),
+        @('d4f940ab-401b-4efc-aadc-ad5f3c50688a', 'Block all Office applications from creating child processes', 'Medium', 'client'),
+        @('3b576869-a4ec-4529-8536-b80a7769e899', 'Block Office applications from creating executable content', 'Low', 'client'),
+        @('75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84', 'Block Office applications from injecting code into other processes', 'Low', 'client'),
+        @('92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b', 'Block Win32 API calls from Office macros', 'Low', 'client'),
+        @('26190899-1602-49e8-8b27-eb1d0a1ce869', 'Block Office communication application from creating child processes', 'Low', 'client'),
+        @('7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c', 'Block Adobe Reader from creating child processes', 'Low', 'client'),
+        @('d1e49aac-8f56-4280-b9ba-993a6d77406c', 'Audit process creations from PSExec and WMI commands', 'Low', 'client')
+    )
+    $n = 20
+    foreach ($a in $asr) {
+        $n++
+        $isAudit = $a[1].StartsWith('Audit')
+        $list.Add(@{ id = "DEF-$n"; area = 'Defender'; sev = $a[2]; fix = 'review'; kind = 'asr'
+            scope = @('defender') + $(if ($a[3] -ne 'all') { @($a[3]) } else { @() })
+            guid = $a[0]; want = $(if ($isAudit) { 2 } else { 1 }); accept = $(if ($isAudit) { @(1, 2) } else { @(1) })
+            title = "Attack surface reduction: $($a[1])"
+            why = 'Attack surface reduction rules stop behaviour that malware typically shows and legitimate software rarely needs.'
+            ms = "Configure Attack Surface Reduction rules: $($a[0]) = $(if ($isAudit) { 'Audit' } else { 'Block' })"
+            impact = 'Some line-of-business software trips ASR rules. Run the rule in audit mode first (Add-MpPreference -AttackSurfaceReductionRules_Actions AuditMode) and check the Defender events 1121/1122.' })
+    }
+
+    # --- firewall ----------------------------------------------------------
+    foreach ($p in 'Domain', 'Private', 'Public') {
+        $list.Add(@{ id = "FW-0$(@{ Domain = 1; Private = 2; Public = 3 }[$p])"; area = 'Firewall'; sev = 'High'; fix = 'review'; kind = 'custom'
+            profile = $p
+            title = "Turn on the Windows Firewall ($p profile) and block unsolicited inbound connections"
+            why = 'The firewall is the last barrier between the network and every listening service on this machine.'
+            ms = "Windows Defender Firewall, $p profile: Firewall state = On, Inbound connections = Block"
+            impact = 'Inbound connections that no firewall rule allows are blocked: check that the rules for the services this machine offers exist first.'
+            get = { param($C, $Ctx)
+                $a = Get-NetFirewallProfile -Name $C.profile -PolicyStore ActiveStore
+                $l = Get-NetFirewallProfile -Name $C.profile
+                $on = "$($a.Enabled)" -eq 'True'
+                $in = "$($a.DefaultInboundAction)"
+                $inOk = $in -ne 'Allow'
+                @{ ok = ($on -and $inOk); state = @{ enabled = "$($l.Enabled)"; inbound = "$($l.DefaultInboundAction)" }
+                   items = @((New-CheckItem 'Firewall state' 'On' $(if ($on) { 'On' } else { 'Off' }) $on),
+                             (New-CheckItem 'Inbound connections' 'Block' $(if ($in -eq 'NotConfigured') { 'Block (default)' } else { $in }) $inOk)) } }
+            set = { param($C, $S) Set-NetFirewallProfile -Name $C.profile -Enabled True -DefaultInboundAction Block }
+            restore = { param($C, $S) Set-NetFirewallProfile -Name $C.profile -Enabled $S.enabled -DefaultInboundAction $S.inbound } })
+    }
+    $list.Add(@{ id = 'FW-04'; area = 'Firewall'; sev = 'Low'; fix = 'safe'; kind = 'custom'
+        title = 'Log dropped packets and allowed connections in the firewall'
+        why = 'The firewall log shows scans and blocked connection attempts.'
+        ms = 'Windows Defender Firewall, all profiles: Log dropped packets = Yes, Log successful connections = Yes'
+        get = { param($C, $Ctx)
+            $items = @(); $st = @{}
+            foreach ($p in 'Domain', 'Private', 'Public') {
+                $a = Get-NetFirewallProfile -Name $p -PolicyStore ActiveStore
+                $l = Get-NetFirewallProfile -Name $p
+                $st[$p] = @{ blocked = "$($l.LogBlocked)"; allowed = "$($l.LogAllowed)" }
+                $b = "$($a.LogBlocked)" -eq 'True'
+                $w = "$($a.LogAllowed)" -eq 'True'
+                $items += New-CheckItem ('{0} profile: log dropped packets / successful connections' -f $p) 'Yes / Yes' ('{0} / {1}' -f $(if ($b) { 'Yes' } else { 'No' }), $(if ($w) { 'Yes' } else { 'No' })) ($b -and $w)
+            }
+            @{ ok = (@($items | Where-Object { -not $_.ok }).Count -eq 0); items = $items; state = $st } }
+        set = { param($C, $S) Set-NetFirewallProfile -Name Domain, Private, Public -LogBlocked True -LogAllowed True }
+        restore = { param($C, $S) foreach ($p in 'Domain', 'Private', 'Public') { Set-NetFirewallProfile -Name $p -LogBlocked $S.$p.blocked -LogAllowed $S.$p.allowed } } })
+
+    # --- remote access -----------------------------------------------------
+    $list.Add(@{ id = 'RDP-01'; area = 'Remote access'; sev = 'High'; fix = 'review'; match = 'first'
+        title = 'Require Network Level Authentication for Remote Desktop'
+        why = 'Without NLA the logon screen is reachable before authentication, which exposes the machine to pre-auth exploits like BlueKeep and to password spraying.'
+        ms = 'Remote Desktop Session Host: Require user authentication for remote connections by using Network Level Authentication = Enabled'
+        impact = 'Very old RDP clients without CredSSP can no longer connect; users whose password has expired must change it elsewhere first.'
+        items = @((Reg $TS 'UserAuthentication' 1), (Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication' 1)) })
+    $list.Add(@{ id = 'RDP-02'; area = 'Remote access'; sev = 'Medium'; fix = 'safe'
+        title = 'Use high encryption and secure RPC for Remote Desktop'
+        why = 'Lower levels allow weaker encryption of the RDP session.'
+        ms = 'Remote Desktop Session Host: Set client connection encryption level = High Level; Require secure RPC communication = Enabled'
+        items = @((Reg $TS 'MinEncryptionLevel' 3), (Reg $TS 'fEncryptRPCTraffic' 1)) })
+    $list.Add(@{ id = 'RDP-03'; area = 'Remote access'; sev = 'Low'; fix = 'safe'
+        title = 'Do not let the Remote Desktop client save passwords'
+        why = 'Saved RDP passwords can be read back by anyone who gets into the user''s session.'
+        ms = 'Remote Desktop Connection Client: Do not allow passwords to be saved = Enabled'
+        items = @(Reg $TS 'DisablePasswordSaving' 1) })
+    $list.Add(@{ id = 'RDP-04'; area = 'Remote access'; sev = 'Low'; fix = 'review'
+        title = 'Always ask for the password on Remote Desktop connections'
+        why = 'Stops logons with credentials that were saved in a client.'
+        ms = 'Remote Desktop Session Host: Always prompt for password upon connection = Enabled'
+        impact = 'Single sign-on from saved RDP credentials stops working.'
+        items = @(Reg $TS 'fPromptForPassword' 1) })
+    $list.Add(@{ id = 'RDP-05'; area = 'Remote access'; sev = 'Low'; fix = 'review'
+        title = 'Do not allow drive redirection in Remote Desktop'
+        why = 'Redirected drives let files move between the client and this machine unnoticed (malware in, data out).'
+        ms = 'Remote Desktop Session Host: Do not allow drive redirection = Enabled'
+        impact = 'Users can no longer copy files through their local drives in an RDP session.'
+        items = @(Reg $TS 'fDisableCdm' 1) })
+    $list.Add(@{ id = 'RDP-06'; area = 'Remote access'; sev = 'Low'; fix = 'safe'
+        title = 'Turn off solicited Remote Assistance'
+        why = 'Remote Assistance invitations give someone else control of the session.'
+        ms = 'Remote Assistance: Configure Solicited Remote Assistance = Disabled (Windows 11 baseline)'
+        items = @(Reg $TS 'fAllowToGetHelp' 0) })
+    $list.Add(@{ id = 'WRM-01'; area = 'Remote access'; sev = 'High'; fix = 'review'
+        title = 'Do not allow Basic authentication or unencrypted traffic on the WinRM service'
+        why = 'Basic authentication sends the password with every request; unencrypted WinRM can be read on the network.'
+        ms = 'WinRM Service: Allow Basic authentication = Disabled; Allow unencrypted traffic = Disabled'
+        impact = 'Tools that connect with Basic authentication (some Linux or monitoring tools) must switch to Kerberos, NTLM or certificates over HTTPS.'
+        items = @((Reg "$PW\WinRM\Service" 'AllowBasic' 0), (Reg "$PW\WinRM\Service" 'AllowUnencryptedTraffic' 0)) })
+    $list.Add(@{ id = 'WRM-02'; area = 'Remote access'; sev = 'Medium'; fix = 'safe'
+        title = 'Do not use Basic or Digest authentication or unencrypted traffic in the WinRM client'
+        why = 'This machine would otherwise send passwords in a weakly protected form when it connects to other machines.'
+        ms = 'WinRM Client: Allow Basic authentication = Disabled; Allow unencrypted traffic = Disabled; Disallow Digest authentication = Enabled'
+        items = @((Reg "$PW\WinRM\Client" 'AllowBasic' 0), (Reg "$PW\WinRM\Client" 'AllowUnencryptedTraffic' 0), (Reg "$PW\WinRM\Client" 'AllowDigest' 0)) })
+    $list.Add(@{ id = 'WRM-03'; area = 'Remote access'; sev = 'Low'; fix = 'safe'
+        title = 'Do not let WinRM store RunAs credentials'
+        why = 'Stored RunAs credentials of PowerShell session configurations can be misused.'
+        ms = 'WinRM Service: Disallow WinRM from storing RunAs credentials = Enabled'
+        items = @(Reg "$PW\WinRM\Service" 'DisableRunAs' 1) })
+
+    # --- system ------------------------------------------------------------
+    $list.Add(@{ id = 'SYS-01'; area = 'System'; sev = 'Medium'; fix = 'safe'
+        title = 'Turn off AutoRun and AutoPlay'
+        why = 'AutoRun starts programs from inserted media without asking.'
+        ms = 'AutoPlay Policies: Turn off Autoplay = All drives; Set the default behavior for AutoRun = Do not execute; Disallow Autoplay for non-volume devices = Enabled'
+        items = @((Reg $ExpP 'NoDriveTypeAutoRun' 255), (Reg $ExpP 'NoAutorun' 1), (Reg "$PW\Explorer" 'NoAutoplayfornonVolume' 1)) })
+    $list.Add(@{ id = 'SYS-02'; area = 'System'; sev = 'High'; fix = 'safe'
+        title = 'Never install Windows Installer packages with elevated rights'
+        why = 'With "Always install elevated", every user can become administrator with a crafted .msi file.'
+        ms = 'Windows Installer: Always install with elevated privileges = Disabled; Allow user control over installs = Disabled'
+        items = @((Reg "$PW\Installer" 'AlwaysInstallElevated' 0 -Default 0), (Reg "$PW\Installer" 'EnableUserControl' 0 -Default 0)) })
+    $list.Add(@{ id = 'SYS-03'; area = 'System'; sev = 'Low'; fix = 'safe'
+        title = 'Turn on SEHOP exploit protection'
+        why = 'Structured Exception Handler Overwrite Protection blocks a common class of memory exploits.'
+        ms = 'MS Security Guide: Enable Structured Exception Handling Overwrite Protection (SEHOP) = Enabled'
+        items = @(Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 0) })
+    $list.Add(@{ id = 'SYS-04'; area = 'System'; sev = 'Low'; fix = 'safe'
+        title = 'Do not load boot drivers that the antimalware rates as bad'
+        why = 'Early Launch Antimalware checks boot drivers before they start.'
+        ms = 'Early Launch Antimalware: Boot-Start Driver Initialization Policy = Good, unknown and bad but critical'
+        items = @(Reg 'HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch' 'DriverLoadPolicy' @(1, 3, 8) -Op 'in' -Default 3 -Set 3) })
+    $list.Add(@{ id = 'SYS-05'; area = 'System'; sev = 'Low'; fix = 'safe'
+        title = 'Strengthen the permissions of internal system objects'
+        why = 'Stops normal users from changing shared system objects such as symbolic links.'
+        ms = 'System objects: Strengthen default permissions of internal system objects = Enabled'
+        items = @(Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'ProtectionMode' 1 -Default 1) })
+    $list.Add(@{ id = 'SYS-06'; area = 'System'; sev = 'Low'; fix = 'review'
+        title = 'Block external devices that do not support Kernel DMA Protection'
+        why = 'Thunderbolt and other DMA devices can read memory directly, for example to steal BitLocker keys.'
+        ms = 'Kernel DMA Protection: Enumeration policy for external devices incompatible with Kernel DMA Protection = Block all'
+        impact = 'Older Thunderbolt docks and devices stop working until a user logs on, or at all.'
+        items = @(Reg "$PW\Kernel DMA Protection" 'DeviceEnumerationPolicy' 0) })
+    $list.Add(@{ id = 'SYS-07'; area = 'System'; sev = 'Low'; fix = 'review'
+        title = 'Turn on SmartScreen for downloaded programs'
+        why = 'SmartScreen warns before unknown or malicious downloaded programs run, and the user cannot ignore the warning.'
+        ms = 'File Explorer: Configure Windows Defender SmartScreen = Warn and prevent bypass'
+        impact = 'Unsigned or rare downloaded programs are blocked until an administrator unblocks them.'
+        items = @((Reg "$PW\System" 'EnableSmartScreen' 1), (Reg "$PW\System" 'ShellSmartScreenLevel' 'Block' -Type 'String')) })
+    $list.Add(@{ id = 'SYS-08'; area = 'System'; sev = 'Low'; fix = 'safe'; minBuild = 26100
+        title = 'Keep the Mark of the Web on files copied from untrusted places'
+        why = 'The Mark of the Web makes Office and SmartScreen treat downloaded files with care.'
+        ms = 'File Explorer: Do not apply the Mark of the Web tag to files copied from insecure sources = Disabled'
+        items = @(Reg "$PW\Explorer" 'DisableMotWOnInsecurePathCopy' 0) })
+    $list.Add(@{ id = 'SYS-09'; area = 'System'; sev = 'Low'; fix = 'safe'; minBuild = 26100
+        title = 'Turn off sudo for Windows'
+        why = 'Sudo is a new way to elevate that bypasses the usual UAC experience.'
+        ms = 'System: Configure the behavior of the sudo command = Disabled'
+        items = @(Reg "$PW\Sudo" 'Enabled' 0) })
+    $list.Add(@{ id = 'SYS-10'; area = 'System'; sev = 'Low'; fix = 'safe'
+        title = 'Do not index encrypted files'
+        why = 'The search index would keep the contents of encrypted files unencrypted.'
+        ms = 'Search: Allow indexing of encrypted files = Disabled'
+        items = @(Reg "$PW\Windows Search" 'AllowIndexingEncryptedStoresOrItems' 0) })
+    $list.Add(@{ id = 'SYS-11'; area = 'System'; sev = 'Low'; fix = 'safe'; scope = @('member')
+        title = 'Do not list local users on the logon screen'
+        why = 'The list tells an attacker which local accounts to try.'
+        ms = 'Logon: Enumerate local users on domain-joined computers = Disabled'
+        items = @(Reg "$PW\System" 'EnumerateLocalUsers' 0) })
+    $list.Add(@{ id = 'SYS-12'; area = 'System'; sev = 'High'; fix = 'safe'
+        title = 'Let only administrators install printer drivers'
+        why = 'Point and Print driver installation by normal users was the PrintNightmare attack (CVE-2021-34527).'
+        ms = 'Printers: Limits print driver installation to Administrators = Enabled'
+        items = @(Reg "$PNT\Printers\PointAndPrint" 'RestrictDriverInstallationToAdministrators' 1 -Default 1) })
+    $list.Add(@{ id = 'SYS-13'; area = 'System'; sev = 'Medium'; fix = 'safe'
+        title = 'Require packet privacy for print spooler RPC'
+        why = 'Protects the print spooler RPC interface against relay attacks (CVE-2021-1678).'
+        ms = 'MS Security Guide: Configure RPC packet level privacy setting for incoming connections = Enabled'
+        items = @(Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Print' 'RpcAuthnLevelPrivacyEnabled' 1 -Default 1) })
+    $list.Add(@{ id = 'SYS-14'; area = 'System'; sev = 'Low'; fix = 'safe'
+        title = 'Re-apply registry policies even when Group Policy has not changed'
+        why = 'Puts back policy settings that were changed locally, at every Group Policy refresh.'
+        ms = 'Group Policy: Configure registry policy processing = Process even if the Group Policy objects have not changed'
+        items = @((Reg "$PW\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}" 'NoGPOListChanges' 0),
+                  (Reg "$PW\Group Policy\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}" 'NoBackgroundPolicy' 0)) })
+    $list.Add(@{ id = 'SYS-15'; area = 'System'; sev = 'High'; fix = 'review'; kind = 'custom'; scope = @('dc')
+        title = 'Turn off the Print Spooler on domain controllers'
+        why = 'A running spooler on a DC can be forced to authenticate to an attacker (PrinterBug) and has had many critical flaws (PrintNightmare).'
+        ms = 'Microsoft guidance: disable the Print Spooler service on domain controllers'
+        impact = 'The DC can no longer print or share printers, and printer pruning of published printers stops.'
+        allowShared = $false
+        get = { param($C, $Ctx) Test-Spooler $C }
+        set = { param($C, $S) Stop-Service Spooler -Force; Set-Service Spooler -StartupType Disabled }
+        restore = { param($C, $S) if ($S) { Set-Service Spooler -StartupType $S.start; if ($S.running) { Start-Service Spooler } } } })
+    $list.Add(@{ id = 'SYS-16'; area = 'System'; sev = 'Low'; fix = 'review'; kind = 'custom'; scope = @('server', 'notdc')
+        title = 'Turn off the Print Spooler on servers that are not print servers'
+        why = 'The spooler is a frequent target (PrintNightmare) and not needed on a server that shares no printers.'
+        ms = 'Microsoft guidance: disable the Print Spooler where it is not needed'
+        impact = 'Nobody can print from this server any more (for example from an RDP session or an application that prints).'
+        allowShared = $true
+        get = { param($C, $Ctx) Test-Spooler $C }
+        set = { param($C, $S) Stop-Service Spooler -Force; Set-Service Spooler -StartupType Disabled }
+        restore = { param($C, $S) if ($S) { Set-Service Spooler -StartupType $S.start; if ($S.running) { Start-Service Spooler } } } })
+    $list.Add(@{ id = 'SYS-17'; area = 'System'; sev = 'Medium'; fix = 'safe'; kind = 'custom'; reboot = $true
+        title = 'Remove Windows PowerShell 2.0'
+        why = 'PowerShell 2.0 has no script block logging and no AMSI, so attackers use it to run scripts unseen. Microsoft removed it from Windows 11 24H2 and Server 2025.'
+        ms = 'Microsoft guidance: Windows PowerShell 2.0 is deprecated, remove it'
+        get = { param($C, $Ctx)
+            $f = Get-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -ErrorAction SilentlyContinue
+            $state = if ($f) { "$($f.State)" } else { 'not available' }
+            $ok = $state -ne 'Enabled'
+            @{ ok = $ok; state = $state; items = @(New-CheckItem 'Windows feature MicrosoftWindowsPowerShellV2Root' 'Disabled' $state $ok) } }
+        set = { param($C, $S) Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart -WarningAction SilentlyContinue | Out-Null }
+        restore = { param($C, $S) if ($S -eq 'Enabled') { Enable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -All -NoRestart -WarningAction SilentlyContinue | Out-Null } } })
+    $list.Add(@{ id = 'SYS-18'; area = 'System'; sev = 'Low'; fix = 'manual'; kind = 'custom'
+        title = 'Boot with Secure Boot'
+        why = 'Secure Boot stops boot kits and is needed for Credential Guard and LSA protection with UEFI lock.'
+        ms = 'Microsoft guidance: UEFI with Secure Boot'
+        how = 'Turn on Secure Boot in the UEFI firmware (on Hyper-V: a generation 2 VM, Settings > Security > Enable Secure Boot). Machines that boot in legacy BIOS mode must be converted with mbr2gpt first.'
+        get = { param($C, $Ctx)
+            $now = try { if (Confirm-SecureBootUEFI) { 'on' } else { 'off' } } catch { 'not supported (legacy BIOS boot)' }
+            @{ ok = ($now -eq 'on'); state = $null; items = @(New-CheckItem 'Secure Boot' 'on' $now ($now -eq 'on')) } } })
+    $list.Add(@{ id = 'SYS-19'; area = 'System'; sev = 'Medium'; fix = 'manual'; kind = 'custom'; scope = @('client')
+        title = 'Encrypt the system drive with BitLocker'
+        why = 'Without disk encryption, anyone with the device can read all data and the cached credentials.'
+        ms = 'Windows 11 baseline: BitLocker GPO'
+        how = 'Turn on BitLocker for the system drive (manage-bde -on C: -RecoveryPassword, or through Intune / MBAM), and keep the recovery key in Active Directory or Entra ID.'
+        get = { param($C, $Ctx)
+            $d = $env:SystemDrive
+            $v = $null
+            try { $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$d'" } catch { }
+            $now = if (-not $v) { 'BitLocker is not available' } elseif ($v.ProtectionStatus -eq 1) { 'protection on' } else { 'protection off' }
+            @{ ok = ($now -eq 'protection on'); state = $null; items = @(New-CheckItem "BitLocker on $d" 'protection on' $now ($now -eq 'protection on')) } } })
+
+    # --- TLS -----------------------------------------------------------------
+    $tls = @(
+        @('TLS-01', 'SSL 3.0', 'High', $(if ($old) { 1 } else { 0 })),
+        @('TLS-02', 'TLS 1.0', 'Medium', 1),
+        @('TLS-03', 'TLS 1.1', 'Low', 1)
+    )
+    foreach ($t in $tls) {
+        $list.Add(@{ id = $t[0]; area = 'TLS'; sev = $t[2]; fix = 'review'; reboot = $true
+            title = "Turn off $($t[1])"
+            why = "$($t[1]) has known weaknesses (POODLE, BEAST) and is deprecated; Microsoft is turning TLS 1.0 and 1.1 off by default in new Windows versions."
+            ms = 'Microsoft TLS guidance: TLS 1.0 and TLS 1.1 deprecation in Windows (not part of the GPO baseline)'
+            impact = "Clients and servers that cannot use TLS 1.2 (old Windows, Java 6/7, old SQL Server drivers, old appliances) can no longer connect to or from this machine. Check the Schannel events and IIS logs first."
+            items = @((Reg "$Sch\$($t[1])\Server" 'Enabled' 0 -Default $t[3]), (Reg "$Sch\$($t[1])\Client" 'Enabled' 0 -Default $t[3])) })
+    }
+    $list.Add(@{ id = 'TLS-04'; area = 'TLS'; sev = 'Low'; fix = 'safe'
+        title = 'Let .NET Framework applications use strong cryptography and the system TLS versions'
+        why = 'Without these, older .NET applications may still offer TLS 1.0 and weak ciphers.'
+        ms = 'Microsoft TLS guidance: Transport Layer Security best practices with the .NET Framework'
+        items = @((Reg 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' 'SchUseStrongCrypto' 1),
+                  (Reg 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' 'SystemDefaultTlsVersions' 1),
+                  (Reg 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319' 'SchUseStrongCrypto' 1),
+                  (Reg 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319' 'SystemDefaultTlsVersions' 1)) })
+
+    foreach ($c in $list) {
+        if (-not $c.kind) { $c.kind = 'reg' }
+        if (-not $c.match) { $c.match = 'all' }
+        if (-not $c.scope) { $c.scope = @() }
+    }
+    $list
+}
+
+function Test-Spooler($C) {
+    $s = Get-Service Spooler -ErrorAction SilentlyContinue
+    if (-not $s) { return @{ ok = $true; state = $null; items = @(New-CheckItem 'Print Spooler service' 'Disabled' 'not installed' $true) } }
+    $start = "$($s.StartType)"
+    $shared = 0
+    if ($C.allowShared) { $shared = @(Get-CimInstance Win32_Printer -Filter 'Shared = TRUE' -ErrorAction SilentlyContinue).Count }
+    $ok = $start -eq 'Disabled' -or $shared -gt 0
+    $now = "$start, $($s.Status)" + $(if ($shared) { ", shares $shared printers (needed)" } else { '' })
+    $want = if ($C.allowShared) { 'Disabled (unless this is a print server)' } else { 'Disabled' }
+    @{ ok = $ok; state = @{ start = $start; running = ("$($s.Status)" -eq 'Running') }; items = @(New-CheckItem 'Print Spooler service' $want $now $ok) }
+}
+
+function Test-Scope($C, $H, $Ctx) {
+    foreach ($s in @($C.scope)) {
+        switch ($s) {
+            'server'   { if (-not $H.server) { return $false } }
+            'client'   { if ($H.server) { return $false } }
+            'dc'       { if (-not $H.dc) { return $false } }
+            'notdc'    { if ($H.dc) { return $false } }
+            'member'   { if (-not $H.domain -or $H.dc) { return $false } }
+            'domain'   { if (-not $H.domain) { return $false } }
+            'defender' { if (-not $Ctx.defender) { return $false } }
+        }
+    }
+    -not ($C.minBuild -and $H.build -lt $C.minBuild)
+}
+
+# --------------------------------------------------------------------------
+# audit, findings
+# --------------------------------------------------------------------------
+
+function Invoke-Audit($Catalog, $Ctx, $Accepted) {
+    foreach ($c in $Catalog) {
+        $r = [pscustomobject]@{ id = $c.id; area = $c.area; title = $c.title; severity = $c.sev; fix = $c.fix
+                                status = 'pass'; items = @(); state = $null; error = $null; changed = $false; check = $c }
+        try {
+            $t = Test-Check $c $Ctx
+            $r.items = @($t.items)
+            $r.state = $t.state
+            $r.status = if ($t.ok) { 'pass' } else { 'fail' }
+        } catch {
+            $r.status = 'error'
+            $r.error = $_.Exception.Message
+        }
+        if ($r.status -ne 'pass' -and (Test-IdMatch $c.id $c.area $Accepted)) { $r.status = 'exception' }
+        $r
+    }
+}
+
+function New-Finding([hashtable]$F) {
+    $out = [ordered]@{}
+    foreach ($k in 'title', 'severity', 'description', 'mitigation', 'references', 'component_name',
+                   'component_version', 'vuln_id_from_tool', 'unique_id_from_tool') {
+        $v = $F[$k]
+        if ($null -eq $v -or ($v -is [string] -and $v -eq '')) { continue }
+        $out[$k] = $v
+    }
+    $out['title'] = Get-Clip $out['title'] 500
+    $out['static_finding'] = $true
+    $out['dynamic_finding'] = $false
+    $out['tags'] = $F['tags']
+    $out
+}
+
+function Get-FixText($C) {
+    switch ($C.fix) {
+        'safe'   { return "Fix: vulnagent-harden.ps1 -Apply safe -Only $($C.id)" }
+        'review' { return "Test the impact first, then fix: vulnagent-harden.ps1 -Apply all -Only $($C.id)" }
+    }
+    "Fix by hand: $($C.how)"
+}
+
+function ConvertTo-HardeningFinding($R, [bool]$Passed) {
+    $c = $R.check
+    $desc = @("**Check:** $($c.id) ($($c.area))", "**Why:** $($c.why)", "**Microsoft baseline:** $($c.ms)")
+    $desc += '**Expected:** ' + (($R.items | ForEach-Object { '{0} = {1}' -f $_.setting, $_.want }) -join '; ')
+    if ($c.impact) { $desc += "**Possible impact:** $($c.impact)" }
+    if ($c.reboot) { $desc += '**Restart needed** after the change.' }
+    if ($Passed) {
+        $title = "$($c.title) (compliant)"; $sev = 'Info'; $uid = "harden-ok|$($c.id)"
+        $mit = 'Nothing to do.'
+    } else {
+        $title = $c.title; $sev = $c.sev; $uid = "harden|$($c.id)"
+        # the current value goes here, not in the description, so a changed value does not reopen the finding
+        $now = ($R.items | Where-Object { -not $_.ok } | ForEach-Object { '{0} = {1}' -f $_.setting, $_.now }) -join '; '
+        $mit = "Now: $now. " + (Get-FixText $c)
+        if ($c.fix -ne 'manual') { $mit += ' In a domain, set it in a Group Policy instead, or it may be overwritten.' }
+    }
+    New-Finding @{
+        title = $title; severity = $sev; description = ($desc -join "`n"); mitigation = $mit
+        references = 'https://www.microsoft.com/en-us/download/details.aspx?id=55319'
+        component_name = 'Windows hardening'; vuln_id_from_tool = $c.id; unique_id_from_tool = $uid
+        tags = @('vulnagent', 'windows', 'hardening', ($c.area.ToLower() -replace ' ', '-'), "fix-$($c.fix)")
+    }
+}
+
+# --------------------------------------------------------------------------
+# HTML report
+# --------------------------------------------------------------------------
+
+function Format-Html($Text) { [Net.WebUtility]::HtmlEncode("$Text") }
+
+function Get-StatusBadge($R) {
+    switch ($R.status) {
+        'fail'      { return '<span class="sev s-' + $R.severity.ToLower() + '">' + $R.severity + '</span>' }
+        'pass'      { return '<span class="sev s-pass">Pass</span>' }
+        'exception' { return '<span class="sev s-exc">Exception</span>' }
+    }
+    '<span class="sev s-err">Error</span>'
+}
+
+$FixLabels = @{ safe = 'safe: -Apply safe'; review = 'review: -Apply all'; manual = 'by hand' }
+
+$HtmlStyle = @'
+body{font:14px/1.45 "Segoe UI",system-ui,sans-serif;background:#fff;color:#1d1d1f;margin:0 auto;padding:24px 16px;max-width:1300px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:32px 0 8px}h2 small{font-weight:400;color:#666}
+.mut,th,.kind,.none{color:#666}.none{font-style:italic}
+.cards{display:flex;flex-wrap:wrap;margin:18px -5px 6px}
+.card{background:#f4f4f6;border:2px solid transparent;border-radius:8px;padding:8px 16px;margin:5px;min-width:96px;text-align:left;font:inherit;color:inherit}
+button.card{cursor:pointer}button.card.on{border-color:#1d1d1f}
+.n{display:block;font-size:24px;font-weight:700;line-height:1.2}
+.c-critical,.bad{color:#b00020}.c-high,.soon{color:#e65100}.c-medium{color:#b7791f}.c-low{color:#0277bd}.c-info,.c-exception{color:#777}.good,.c-pass{color:#2e7d32}.c-error{color:#6a1b9a}.bad{font-weight:700}
+.sev{display:inline-block;color:#fff;border-radius:4px;padding:1px 7px;font-size:11px;font-weight:700;min-width:54px;text-align:center}
+.s-critical{background:#b00020}.s-high{background:#e65100}.s-medium{background:#f9a825;color:#1d1d1f}.s-low{background:#0277bd}.s-info{background:#888}
+.s-pass{background:#2e7d32}.s-exc{background:#777}.s-err{background:#6a1b9a}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid #e3e3e3;padding:6px 8px;text-align:left;vertical-align:top}th{font-weight:600;white-space:nowrap}
+.wrap{overflow-x:auto}summary{cursor:pointer}
+.desc{margin:6px 0 2px;padding:8px 10px;background:#f4f4f6;border-radius:6px;word-wrap:break-word}
+.desc table{margin:6px 0;font-size:12px}.desc th,.desc td{padding:3px 6px;border-color:#ddd}
+.kind{white-space:nowrap}.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+.bar{display:flex;flex-wrap:wrap;align-items:center;margin:8px 0}.bar>*{margin:0 10px 6px 0}
+#q{width:320px;max-width:100%;padding:6px 10px;border:1px solid #bbb;border-radius:6px;font:inherit;background:inherit;color:inherit}
+#all{padding:6px 10px;border:1px solid #bbb;border-radius:6px;background:inherit;color:inherit;font:inherit;cursor:pointer}
+.warn{border-left:4px solid #e65100;background:#fff4e5;padding:8px 12px;margin:14px 0;border-radius:4px}
+.okbox{border-left:4px solid #2e7d32;background:#edf7ee;padding:8px 12px;margin:14px 0;border-radius:4px}
+.chg{color:#2e7d32;font-weight:600}
+a{color:inherit}ul{margin:4px 0;padding-left:20px}
+@media (prefers-color-scheme:dark){body{background:#141416;color:#ececec}.mut,th,.kind,.none,h2 small{color:#9a9a9a}
+.card,.desc{background:#1e1e22}th,td{border-color:#2c2c30}.desc th,.desc td{border-color:#34343a}button.card.on{border-color:#ececec}
+.warn{background:#2a2015}.okbox{background:#15241a}
+.c-critical,.bad{color:#ff6b6b}.c-high,.soon{color:#ff9e40}.c-medium{color:#f9c74f}.c-low{color:#4fc3f7}.good,.c-pass,.chg{color:#81c784}.c-error{color:#ce93d8}}
+@media print{.bar,#all{display:none}body{max-width:none}}
+'@
+
+$HtmlScript = @'
+(function () {
+  var q = document.getElementById('q'), sp = document.getElementById('sp'), on = {}, rows = document.getElementById('checks').tBodies[0].rows;
+  function each(list, fn) { for (var i = 0; i < list.length; i++) fn(list[i]); }
+  function apply() {
+    var t = q.value.toLowerCase(), any = false, n = 0, k;
+    for (k in on) { if (on[k]) any = true; }
+    each(rows, function (r) {
+      var key = r.getAttribute('data-key');
+      var ok = (any ? on[key] : (sp.checked || key !== 'pass')) && (!t || r.textContent.toLowerCase().indexOf(t) >= 0);
+      r.style.display = ok ? '' : 'none';
+      if (ok) n++;
+    });
+    document.getElementById('shown').innerHTML = n;
+  }
+  each(document.querySelectorAll('button.card'), function (c) {
+    c.onclick = function () {
+      var s = c.getAttribute('data-key');
+      on[s] = !on[s];
+      c.className = on[s] ? 'card on' : 'card';
+      apply();
+    };
+  });
+  q.oninput = apply; q.onkeyup = apply; sp.onclick = apply;
+  document.getElementById('all').onclick = function () {
+    var d = document.querySelectorAll('#checks details'), o = !(d.length && d[0].open);
+    each(d, function (x) { x.open = o; });
+  };
+  window.onbeforeprint = function () { each(document.querySelectorAll('details'), function (x) { x.open = true; }); };
+  apply();
+})();
+'@
+
+function ConvertTo-HardeningHtml($Report, $Results) {
+    $hi = $Report.system
+    $sum = $Report.summary
+    $all = @($Results | Sort-Object { $StatusOrder[$_.status] }, { $SeverityOrder[$_.severity] }, { $_.id })
+    $out = New-Object Collections.Generic.List[string]
+    $out.Add('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="X-UA-Compatible" content="IE=edge">')
+    $out.Add('<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hardening - ' + (Format-Html $hi.host) + '</title>')
+    $out.Add('<style>' + $HtmlStyle + '</style></head><body>')
+    $out.Add('<h1>Hardening report &ndash; ' + (Format-Html $hi.host) + '</h1>')
+    $meta = @(("$($hi.os) $($hi.version).$($hi.ubr)" + $(if ($hi.release) { " ($($hi.release))" } else { '' })), $hi.role,
+              "generated $(([string]$Report.generated).Replace('T', ' '))", $Report.agent)
+    if ($DryRun) { $meta += 'dry run: not sent to DefectDojo' }
+    $out.Add('<div class="mut">' + (($meta | ForEach-Object { Format-Html $_ }) -join ' &middot; ') + '</div>')
+    $out.Add('<div class="mut">Compared with: ' + (Format-Html $Report.baseline) + '</div>')
+
+    if ($Report.errors) {
+        $out.Add('<div class="warn"><b>Some checks or changes failed</b>, so this report may be incomplete:<ul>' +
+                 (($Report.errors | ForEach-Object { '<li>' + (Format-Html $_) + '</li>' }) -join '') + '</ul></div>')
+    }
+    if (@($Report.changes).Count) {
+        $verb = if ($DryRun) { '<b>Would change</b> (dry run):' } else { '<b>Changed in this run:</b>' }
+        $undoHint = if ($DryRun) { '' } else { ' Undo with <span class="mono">vulnagent-harden.ps1 -Undo last</span>.' }
+        $out.Add('<div class="okbox">' + $verb + ' ' + @($Report.changes).Count + ' checks.' + $undoHint + '<ul>' +
+                 ((@($Report.changes) | ForEach-Object { '<li>' + (Format-Html "$($_.id) $($_.title)") + '</li>' }) -join '') + '</ul>' +
+                 $(if ($Report.restart_needed) { '<b>Restart the machine</b> to finish some of the changes.' } else { '' }) + '</div>')
+    }
+    if (@($Report.undone).Count) {
+        $out.Add('<div class="okbox"><b>Undone in this run:</b> ' + ((@($Report.undone) | ForEach-Object { Format-Html $_ }) -join ', ') + '</div>')
+    }
+
+    # cards: the severity and status cards filter the table
+    $out.Add('<div class="cards">')
+    $cls = if ($sum.score -ge 90) { 'good' } elseif ($sum.score -ge 70) { 'soon' } else { 'bad' }
+    $out.Add('<div class="card"><span class="n ' + $cls + '">' + $sum.score + '%</span>compliant (' + $sum.passed + ' of ' + $sum.checks + ' checks)</div>')
+    foreach ($s in $SeverityOrder.Keys) {
+        $n = @($all | Where-Object { $_.status -eq 'fail' -and $_.severity -eq $s }).Count
+        if ($s -eq 'Info' -and -not $n) { continue }
+        $out.Add('<button class="card" data-key="' + $s + '" title="Show only failed ' + $s + ' checks"><span class="n c-' + $s.ToLower() + '">' + $n + '</span>' + $s + '</button>')
+    }
+    foreach ($s in @(@('pass', 'passed'), @('exception', 'exceptions'), @('error', 'errors'))) {
+        $n = @($all | Where-Object { $_.status -eq $s[0] }).Count
+        if ($s[0] -ne 'pass' -and -not $n) { continue }
+        $out.Add('<button class="card" data-key="' + $s[0] + '"><span class="n c-' + $s[0] + '">' + $n + '</span>' + $s[1] + '</button>')
+    }
+    $out.Add('</div>')
+
+    $out.Add('<h2>Checks <small>(<span id="shown">' + $all.Count + '</span> of ' + $all.Count + ' shown)</small></h2>')
+    $out.Add('<div class="bar"><input id="q" type="search" placeholder="Search checks, settings, IDs..."><label><input id="sp" type="checkbox"> show passed checks</label><button id="all" type="button">Expand / collapse all</button></div>')
+    $rows = foreach ($r in $all) {
+        $c = $r.check
+        $key = if ($r.status -eq 'fail') { $r.severity } else { $r.status }
+        $det = '<b>Why:</b> ' + (Format-Html $c.why)
+        if ($r.items.Count) {
+            $det += '<table><thead><tr><th>Setting</th><th>Expected</th><th>Now</th></tr></thead><tbody>' +
+                    (($r.items | ForEach-Object { '<tr><td class="mono">' + (Format-Html $_.setting) + '</td><td>' + (Format-Html $_.want) +
+                        '</td><td class="' + $(if ($_.ok) { 'good' } else { 'bad' }) + '">' + (Format-Html $_.now) + '</td></tr>' }) -join '') + '</tbody></table>'
+        }
+        if ($r.error) { $det += '<b>Error:</b> ' + (Format-Html $r.error) + '<br>' }
+        if ($c.impact) { $det += '<b>Possible impact:</b> ' + (Format-Html $c.impact) + '<br>' }
+        if ($c.how) { $det += '<b>How to fix:</b> ' + (Format-Html $c.how) + '<br>' }
+        if ($c.reboot) { $det += '<b>Restart needed</b> after a change.<br>' }
+        $det += '<b>Microsoft baseline:</b> ' + (Format-Html $c.ms)
+        $title = (Format-Html $r.title) + $(if ($r.changed) { ' <span class="chg">(changed now)</span>' } else { '' })
+        $fix = if ($r.status -eq 'pass') { '-' } else { $FixLabels[$r.fix] }
+        '<tr data-key="' + $key + '"><td>' + (Get-StatusBadge $r) + '</td><td><details><summary><span class="mono">' + $r.id + '</span> ' + $title +
+            '</summary><div class="desc">' + $det + '</div></details></td><td class="kind">' + (Format-Html $r.area) + '</td><td class="kind">' + $fix + '</td></tr>'
+    }
+    $out.Add('<div class="wrap"><table id="checks"><thead><tr><th>Status</th><th>Check (click for details)</th><th>Area</th><th>Fix</th></tr></thead><tbody>')
+    $out.Add(($rows -join "`n"))
+    $out.Add('</tbody></table></div>')
+    $out.Add('<p class="mut" style="margin-top:32px">Fix: "safe" can be applied with <span class="mono">-Apply safe</span>; "review" can break old clients or applications, test it, then use <span class="mono">-Apply all</span>; "by hand" needs hardware, Active Directory or a decision. Full data: C:\ProgramData\vulnagent\reports\hardening.json</p>')
+    $out.Add('<script>' + $HtmlScript + '</script></body></html>')
+    $out -join "`n"
+}
+
+# --------------------------------------------------------------------------
+# upload
+# --------------------------------------------------------------------------
+
+function New-Multipart($Fields, [string]$FileName, [byte[]]$Content) {
+    $b = [guid]::NewGuid().ToString('N')
+    $enc = New-Object Text.UTF8Encoding $false
+    $ms = New-Object IO.MemoryStream
+    $parts = @()
+    foreach ($k in $Fields.Keys) {
+        $parts += "--$b`r`nContent-Disposition: form-data; name=`"$k`"`r`n`r`n$($Fields[$k])`r`n"
+    }
+    $parts += "--$b`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$FileName`"`r`nContent-Type: application/json`r`n`r`n"
+    foreach ($p in $parts) { $x = $enc.GetBytes($p); $ms.Write($x, 0, $x.Length) }
+    $ms.Write($Content, 0, $Content.Length)
+    $x = $enc.GetBytes("`r`n--$b--`r`n"); $ms.Write($x, 0, $x.Length)
+    @{ body = $ms.ToArray(); type = "multipart/form-data; boundary=$b" }
+}
+
+function Enable-TrustAllCertificates {
+    if (-not ('VulnagentTrustAll' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net;
+public static class VulnagentTrustAll {
+    public static void Enable() { ServicePointManager.ServerCertificateValidationCallback = delegate { return true; }; }
+}
+'@
+    }
+    [VulnagentTrustAll]::Enable()
+}
+
+function Send-ToDefectDojo($Cfg, $HostInfo, $Doc, [bool]$Incomplete) {
+    $base = "$($Cfg.url)".TrimEnd('/')
+    if (-not $base) { throw "DefectDojo url is not set (config 'url' or -Url)" }
+    $tok = if ($Cfg.api_token) { $Cfg.api_token } else { $env:DD_API_TOKEN }
+    if (-not $tok) { throw "DefectDojo API token is not set (config 'api_token', -Token or env DD_API_TOKEN)" }
+    $product = "$($Cfg.product_name)".Replace('{host}', $HostInfo.host).Replace('{short}', $HostInfo.short)
+    $closeOld = [bool]$Cfg.close_old_findings
+    if ($closeOld -and $Incomplete) {
+        Write-Log 'some checks failed to run: not closing old findings this time'
+        $closeOld = $false
+    }
+    $fields = [ordered]@{
+        scan_type                   = $SCAN_TYPE
+        product_type_name           = $Cfg.product_type
+        product_name                = $product
+        engagement_name             = $Cfg.hardening_engagement
+        test_title                  = $Cfg.hardening_test_title
+        auto_create_context         = 'true'
+        close_old_findings          = $(if ($closeOld) { 'true' } else { 'false' })
+        deduplication_on_engagement = 'true'
+        minimum_severity            = $Cfg.minimum_severity
+        active                      = 'true'
+        verified                    = 'false'
+        scan_date                   = (Get-Date).ToString('yyyy-MM-dd')
+        version                     = $VERSION
+    }
+    $json = ConvertTo-Json -InputObject $Doc -Depth 8 -Compress
+    $mp = New-Multipart $fields "vulnagent-harden-$($HostInfo.host).json" ([Text.Encoding]::UTF8.GetBytes($json))
+    $req = @{
+        Uri = "$base/api/v2/reimport-scan/"; Method = 'Post'; Body = $mp.body; ContentType = $mp.type
+        Headers = @{ Authorization = "Token $tok"; Accept = 'application/json' }
+        UseBasicParsing = $true; TimeoutSec = [int]$Cfg.timeout; UserAgent = "vulnagent-harden/$VERSION"
+    }
+    if (-not $Cfg.verify_tls) {
+        if ($PSVersionTable.PSVersion.Major -ge 6) { $req.SkipCertificateCheck = $true } else { Enable-TrustAllCertificates }
+    }
+    try {
+        $r = Invoke-WebRequest @req
+    } catch {
+        $resp = $_.Exception.Response
+        if ($resp) {
+            $code = [int]$resp.StatusCode
+            $detail = $_.ErrorDetails.Message
+            if (-not $detail -and $resp -is [Net.HttpWebResponse]) {
+                try { $detail = (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch { }
+            }
+            $hint = @{ 401 = ' (wrong API token?)'; 403 = ' (the token user may not import into this product type)'
+                       400 = ' (check that the user may create products)' }[$code]
+            throw "DefectDojo returned HTTP $code$hint`n$(Get-Clip "$detail" 2000)"
+        }
+        throw "cannot reach DefectDojo at ${base}: $($_.Exception.Message)"
+    }
+    $content = $r.Content
+    if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
+    $res = if ($content) { $content | ConvertFrom-Json } else { $null }
+    $stats = @()
+    if ($res -and $res.statistics -and $res.statistics.delta) {
+        foreach ($k in 'created', 'closed', 'reactivated', 'untouched') {
+            $t = $res.statistics.delta.$k.total.total
+            if ($null -ne $t) { $stats += "$k $t" }
+        }
+    }
+    $testId = if ($res -and $res.test_id) { $res.test_id } elseif ($res) { $res.test } else { '?' }
+    Write-Log ("uploaded to DefectDojo product '{0}', engagement '{1}' (test {2}){3}" -f $product, $Cfg.hardening_engagement, $testId,
+               $(if ($stats) { ': ' + ($stats -join ', ') } else { '' }))
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+function Save-Backup([string]$Path, $Backup) {
+    Write-JsonFile $Path $Backup
+}
+
+function Invoke-Undo([string]$Which, $All, $Errs) {
+    $file = $Which
+    if ($Which -eq 'last') {
+        $file = Get-ChildItem -Path $BackupDir -Filter 'backup-*.json' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1 |
+            ForEach-Object { $_.FullName }
+    }
+    if (-not $file -or -not (Test-Path $file)) { throw "no backup to undo ($Which): backups are in $BackupDir" }
+    $b = Get-Content -Path $file -Raw | ConvertFrom-Json
+    $byId = @{}
+    foreach ($c in $All) { $byId[$c.id] = $c }
+    $items = @($b.changes)
+    [array]::Reverse($items)
+    $done = @()
+    Write-Log "undo: $($items.Count) changes from $file"
+    foreach ($x in $items) {
+        $c = $byId[$x.id]
+        if (-not $c) { $Errs.Add("undo $($x.id): unknown check"); continue }
+        if ($DryRun) { Write-Log "  would undo $($x.id) $($c.title)"; continue }
+        try {
+            Invoke-Restore $c $x.state
+            $done += $x.id
+            Write-Log "  undone $($x.id) $($c.title)"
+        } catch { $Errs.Add("undo $($x.id): $($_.Exception.Message)") }
+    }
+    if (-not $DryRun) { Move-Item $file ($file -replace 'backup-', 'undone-') -Force }
+    $done
+}
+
+function Invoke-Main {
+    try {
+        Assert-Admin
+        Initialize-DataDir
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072  # TLS 1.2
+        if ($Apply -and $Undo) { throw 'use either -Apply or -Undo, not both' }
+        $cfg = Read-Config $ConfigPath
+        if ($Url) { $cfg.url = $Url }
+        if ($Token) { $cfg.api_token = $Token }
+        if ($Insecure) { $cfg.verify_tls = $false }
+        $hi = Get-HostInfo
+        $ctx = New-Context
+        $all = @(Get-Catalog $hi)
+        $catalog = @($all | Where-Object { Test-Scope $_ $hi $ctx })
+        $accepted = @($cfg.hardening_exclude | Where-Object { $_ })
+
+        if ($List) {
+            $catalog | ForEach-Object { [pscustomobject]@{ ID = $_.id; Severity = $_.sev; Fix = $_.fix; Area = $_.area; Check = $_.title } } |
+                Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
+            Write-Host "$($catalog.Count) checks apply to this $($hi.role) (of $($all.Count))."
+            return 0
+        }
+
+        Write-Log "vulnagent-harden $VERSION on $($hi.host): $($hi.os) build $($hi.build), $($hi.role)"
+        Write-Log "compared with $(Get-BaselineName $hi): $($catalog.Count) checks"
+        $errs = New-Object Collections.Generic.List[string]
+        $undone = @()
+        if ($Undo) {
+            $undone = @(Invoke-Undo $Undo $all $errs)
+            $ctx = New-Context
+        }
+
+        $results = @(Invoke-Audit $catalog $ctx $accepted)
+        $changes = New-Object Collections.Generic.List[object]
+        $restart = $false
+        if ($Apply) {
+            $levels = if ($Apply -eq 'all') { @('safe', 'review') } else { @('safe') }
+            $todo = @($results | Where-Object { $_.status -eq 'fail' -and $levels -contains $_.fix -and
+                (-not $Only -or (Test-IdMatch $_.id $_.area $Only)) -and -not (Test-IdMatch $_.id $_.area $Exclude) })
+            $left = @($results | Where-Object { $_.status -eq 'fail' -and $_.fix -eq 'review' -and $Apply -eq 'safe' -and
+                (-not $Only -or (Test-IdMatch $_.id $_.area $Only)) })
+            Write-Log ("{0}: {1} checks to fix" -f $(if ($DryRun) { '-Apply -DryRun, changing nothing' } else { "-Apply $Apply" }), $todo.Count)
+            $backupFile = Join-Path $BackupDir ('backup-{0}.json' -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
+            $backup = [ordered]@{ created = (Get-Date).ToString('s'); host = $hi.host; agent = "vulnagent-harden $VERSION"; changes = @() }
+            foreach ($r in $todo) {
+                if ($DryRun) {
+                    Write-Log "  would fix $($r.id) $($r.title)"
+                    $changes.Add([pscustomobject]@{ id = $r.id; title = $r.title })
+                    continue
+                }
+                try {
+                    # the backup is written before each change, so it is complete even if the run stops
+                    $backup.changes += [pscustomobject]@{ id = $r.id; title = $r.title; state = $r.state }
+                    Save-Backup $backupFile $backup
+                    Invoke-Fix $r.check $r
+                    $changes.Add([pscustomobject]@{ id = $r.id; title = $r.title })
+                    if ($r.check.reboot) { $restart = $true }
+                    Write-Log "  fixed $($r.id) $($r.title)"
+                } catch {
+                    $errs.Add("$($r.id): $($_.Exception.Message)")
+                }
+            }
+            if ($left.Count) {
+                Write-Log ("  {0} failed checks are marked 'review' and need -Apply all: {1}" -f $left.Count, (($left | ForEach-Object { $_.id }) -join ', '))
+            }
+            if ($changes.Count -and -not $DryRun) {
+                Write-Log "  backup of the old values: $backupFile (undo: vulnagent-harden.ps1 -Undo last)"
+                $ctx = New-Context
+                $results = @(Invoke-Audit $catalog $ctx $accepted)
+                $ids = @($changes | ForEach-Object { $_.id })
+                foreach ($r in $results) {
+                    if ($ids -contains $r.id) {
+                        $r.changed = $true
+                        if ($r.status -eq 'fail') {
+                            $msg = if ($r.check.reboot) { 'takes effect after a restart' } else { 'a Group Policy may set it back' }
+                            Write-Log "  $($r.id) still fails after the change ($msg)"
+                        }
+                    }
+                }
+                if ($restart) { Write-Log 'RESTART NEEDED to finish some of the changes (not restarting automatically)' }
+            }
+        }
+        foreach ($r in $results | Where-Object { $_.status -eq 'error' }) { $errs.Add("$($r.id): $($r.error)") }
+        foreach ($e in $errs) { Write-Log "ERROR $e" }
+
+        # report + upload
+        $applicable = @($results | Where-Object { $_.status -ne 'exception' -and $_.status -ne 'error' })
+        $passed = @($applicable | Where-Object { $_.status -eq 'pass' }).Count
+        $failed = @($results | Where-Object { $_.status -eq 'fail' })
+        $score = if ($applicable.Count) { [int][Math]::Floor(100 * $passed / $applicable.Count) } else { 100 }
+        $findings = New-Object Collections.Generic.List[object]
+        foreach ($r in $failed) { $findings.Add((ConvertTo-HardeningFinding $r $false)) }
+        if ($cfg.hardening_include_passed) {
+            foreach ($r in $results | Where-Object { $_.status -eq 'pass' }) { $findings.Add((ConvertTo-HardeningFinding $r $true)) }
+        }
+        $doc = [ordered]@{
+            name = 'vulnagent-harden'; type = $SCAN_TYPE; version = $VERSION
+            description = '{0} - {1}: {2} of {3} checks pass ({4}%), {5} fail' -f $hi.host, (Get-BaselineName $hi), $passed, $applicable.Count, $score, $failed.Count
+            findings = $findings.ToArray()
+        }
+        $report = [ordered]@{
+            agent = "vulnagent-harden $VERSION"; generated = (Get-Date).ToString('s'); host = $hi.host; system = $hi
+            baseline = (Get-BaselineName $hi); errors = $errs.ToArray(); restart_needed = $restart
+            changes = $changes.ToArray(); undone = $undone
+            summary = [ordered]@{ checks = $applicable.Count; passed = $passed; failed = $failed.Count; score = $score
+                                  exceptions = @($results | Where-Object { $_.status -eq 'exception' }).Count
+                                  errors = @($results | Where-Object { $_.status -eq 'error' }).Count }
+            results = @($results | Select-Object id, area, title, severity, fix, status, changed, error, items)
+        }
+        Write-JsonFile (Join-Path $DataDir 'reports\hardening.json') $report
+        Write-JsonFile (Join-Path $DataDir 'reports\hardening-findings.json') $doc
+        if ($Output) { Write-JsonFile $Output $doc; Write-Log "wrote $Output" }
+        try {
+            $page = ConvertTo-HardeningHtml $report $results
+            Write-TextFile (Join-Path $DataDir 'reports\hardening.html') $page
+            if ($Html) {
+                $Html = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Html)
+                Write-TextFile $Html $page
+                Write-Log "HTML report: $Html"
+            }
+        } catch { Write-Log "ERROR HTML report: $($_.Exception.Message)" }
+        $bySev = foreach ($s in $SeverityOrder.Keys) {
+            $n = @($failed | Where-Object { $_.severity -eq $s }).Count
+            if ($n) { "$s $n" }
+        }
+        Write-Log ("{0} of {1} checks pass ({2}%); failed: {3}" -f $passed, $applicable.Count, $score, $(if ($bySev) { $bySev -join ', ' } else { 'none' }))
+        if ($DryRun) { return 0 }
+
+        Send-ToDefectDojo $cfg $hi $doc (@($results | Where-Object { $_.status -eq 'error' }).Count -gt 0)
+        if ($errs.Count) { return 2 }
+        return 0
+    } catch {
+        Write-Log "ERROR $($_.Exception.Message)"
+        return 3
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.') { exit [int]@(Invoke-Main)[-1] }

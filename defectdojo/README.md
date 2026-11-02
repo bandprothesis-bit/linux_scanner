@@ -25,7 +25,7 @@ What gets uploaded from each machine:
 
 Reporting is one-way. Patching is still controlled by each machine's `/etc/vulnagent/config.json`.
 
-**Windows servers** report to the same DefectDojo with a PowerShell agent. See [windows/README.md](../windows/README.md).
+**Windows servers** report to the same DefectDojo with a PowerShell agent. A second script checks them against the Microsoft security baseline and reports each deviation as a finding, in the engagement *hardening*. See [windows/README.md](../windows/README.md).
 
 Customers with **Microsoft Defender for Endpoint** can feed the same DefectDojo without installing anything on their devices. See [DEFENDER.md](DEFENDER.md).
 

@@ -15,6 +15,8 @@ Every night, as a scheduled task running as SYSTEM, it does this:
 
 Each run also writes a readable **HTML report** of everything it found: see [HTML report](#html-report).
 
+A second script, **vulnagent-harden.ps1**, compares each machine with the **Microsoft security baseline** and reports every deviation to DefectDojo. It can also apply the recommended settings, with a backup and undo. See [Hardening](#hardening-microsoft-security-baseline).
+
 Each machine becomes its own DefectDojo product under the product type **Windows servers**. Fixed findings close automatically, new ones are added, and notes and risk acceptances are kept, the same as on Linux.
 
 Defender antivirus signature updates are ignored. Non-security updates are left out unless you turn on `include_non_security_updates`.
@@ -39,10 +41,10 @@ $env:DD_API_TOKEN = '<your-api-key>'; powershell -ExecutionPolicy Bypass -File .
 
 The installer does four things:
 
-1. Copies the agent to `C:\Program Files\vulnagent\vulnagent-win.ps1`.
+1. Copies the agent and the hardening script to `C:\Program Files\vulnagent\`.
 2. Writes `C:\ProgramData\vulnagent\defectdojo.json`. Only SYSTEM and Administrators can read that folder, because the file holds the key.
-3. Creates the scheduled task **vulnagent**, which runs daily at 03:30 plus up to 45 minutes of random delay.
-4. Runs the first scan. It takes 2–10 minutes, mostly the Windows Update search. Then the server appears in DefectDojo under **Products**.
+3. Creates the scheduled task **vulnagent**, which runs daily at 03:30 plus up to 45 minutes of random delay, and the task **vulnagent-hardening** at the same time. The hardening task only checks and reports; it changes nothing.
+4. Runs the first scan and the first hardening check. The scan takes 2–10 minutes, mostly the Windows Update search. Then the server appears in DefectDojo under **Products**.
 
 Installer options:
 
@@ -53,6 +55,7 @@ Installer options:
 | `-At 22:00` | Change the time of the daily run. |
 | `-Insecure` | Accept a self-signed HTTPS certificate on DefectDojo. Better: import your internal CA into the server's *Trusted Root Certification Authorities*. |
 | `-NoRun` | Don't run the first scan now. |
+| `-NoHardening` | Don't install the hardening script and task (removes them if they were installed before). |
 | `-Uninstall` (`-Purge`) | Remove the task and agent. Add `-Purge` to also delete the config and reports. |
 
 Running the installer again updates the agent and keeps the config.
@@ -83,6 +86,10 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | Scan without uploading, and open the HTML report | `... vulnagent-win.ps1 -DryRun -Html $env:TEMP\vulnagent.html; start $env:TEMP\vulnagent.html` |
 | HTML report of the last nightly run | `Copy-Item C:\ProgramData\vulnagent\reports\latest.html $env:TEMP; start $env:TEMP\latest.html` |
 | Full local report | `C:\ProgramData\vulnagent\reports\latest.json` (includes the list of installed programs) |
+| Hardening check and upload now | `Start-ScheduledTask vulnagent-hardening` |
+| Hardening report without uploading | `... vulnagent-harden.ps1 -DryRun -Html $env:TEMP\hardening.html; start $env:TEMP\hardening.html` |
+| Hardening: apply the safe settings | `... vulnagent-harden.ps1 -Apply safe` (see [Hardening](#hardening-microsoft-security-baseline)) |
+| Hardening log | `Get-Content C:\ProgramData\vulnagent\hardening.log -Tail 30` |
 
 ## HTML report
 
@@ -99,6 +106,87 @@ It contains:
 Printing it (or *Print → Save as PDF*) expands every finding.
 
 The `C:\ProgramData\vulnagent` folder is readable only by administrators, so a browser can't open the file there directly. Copy it out first (see [Daily operation](#daily-operation)), or write it somewhere else with `-Html <path>` when you run the scan by hand.
+
+## Hardening (Microsoft security baseline)
+
+`vulnagent-harden.ps1` checks the machine against the baselines of Microsoft's [Security Compliance Toolkit](https://www.microsoft.com/en-us/download/details.aspx?id=55319):
+
+| Machine | Compared with |
+|---|---|
+| Server (member or standalone) | Windows Server 2025 v2602, *Member Server* |
+| Domain controller | Windows Server 2025 v2602, *Domain Controller* |
+| Workstation | Windows 11 v25H2 |
+
+The values are the newest baseline's, also on Windows Server 2016, 2019 and 2022. Settings that need a newer Windows than the machine has are skipped. On top of the baseline it checks Microsoft's guidance on TLS 1.0/1.1, PowerShell 2.0 and the Print Spooler.
+
+About 120 to 150 checks apply per machine:
+
+| Area | Examples |
+|---|---|
+| SMB | SMB 1.0 off, signing required, no insecure guest logons, anonymous access blocked |
+| Network | LLMNR and NetBIOS name resolution off, hardened SYSVOL/NETLOGON paths, LDAP signing |
+| Credentials | WDigest off, NTLMv2 only, LSA protection, Credential Guard, anonymous enumeration blocked |
+| Accounts | UAC, password length and lockout, Guest disabled, no stored auto-logon password, LAPS |
+| User rights | Debug, act as OS, backup/restore and similar rights; local admins denied network and RDP logon |
+| Audit | 23–30 advanced audit subcategories, command line in 4688 events, PowerShell script block logging, event log sizes |
+| Defender | Real-time, behaviour and cloud protection, PUA blocking, attack surface reduction rules, network protection |
+| Firewall | All three profiles on, inbound blocked by default, logging |
+| Remote access | RDP with NLA and high encryption, WinRM without Basic auth or unencrypted traffic |
+| System | AutoRun off, AlwaysInstallElevated off, Point and Print restricted, Print Spooler on DCs, PowerShell 2.0 removed, Secure Boot, BitLocker |
+| TLS | SSL 3.0, TLS 1.0 and TLS 1.1 off; strong crypto for .NET |
+
+List the checks that apply to a machine with `vulnagent-harden.ps1 -List`.
+
+### In DefectDojo
+
+Each failed check becomes one finding in the machine's product, in the engagement **hardening**, with the check's severity. The description says why it matters, the expected value and the baseline setting. The mitigation shows the current value and how to fix it. Fixed checks close at the next run.
+
+Filter by the tag `hardening` to see all of them across the fleet. The tags `fix-safe`, `fix-review` and `fix-manual` say how each one can be fixed.
+
+### The HTML report
+
+Every run writes `C:\ProgramData\vulnagent\reports\hardening.html`, and `-Html <path>` writes a copy where a browser can open it. It shows the compliance score and the failed checks by severity. Click a check to see the expected and current value of each setting. Passed checks are hidden until you tick *show passed checks*.
+
+### Applying the settings
+
+Each check is marked:
+
+| Mark | Meaning | Applied by |
+|---|---|---|
+| **safe** | Doesn't break a normal, current environment | `-Apply safe` |
+| **review** | Can break old clients, devices or applications. The finding says what. Test it on one machine first. | `-Apply all` |
+| **manual** | Needs hardware, Active Directory or a decision: Credential Guard, Secure Boot, BitLocker, LAPS, the auto-logon password | never automatic |
+
+```powershell
+# see what would change, without changing anything
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-harden.ps1" -Apply safe -DryRun
+
+# apply the safe settings, then check again and upload
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-harden.ps1" -Apply safe
+
+# apply selected "review" checks after testing them: by ID, ID pattern or area
+... vulnagent-harden.ps1 -Apply all -Only SMB-03, SMB-04, LSA-03
+... vulnagent-harden.ps1 -Apply all -Only Firewall -Exclude FW-01
+
+# put back what the last -Apply changed (repeat to go back further)
+... vulnagent-harden.ps1 -Undo last
+```
+
+Before each change the old value is saved in `C:\ProgramData\vulnagent\hardening\backup-<date>-<time>.json`, and `-Undo` puts it back. `-Undo <file>` undoes a specific run. One limitation: password and lockout policy values that did not exist before (for example the lockout duration while lockout was off) cannot be removed again, so they keep the new value.
+
+Some settings need a restart: the output then says `RESTART NEEDED`. The script never restarts the machine.
+
+**In a domain, use Group Policy for the fleet.** The script changes the local settings. A Group Policy that sets the same setting overwrites the local value at the next refresh, so the check fails again. For many machines, import the Microsoft baseline GPOs from the toolkit (`Baseline-ADImport.ps1`) and link them, and use `vulnagent-harden.ps1` to see where they are missing or overridden. Use `-Apply` for standalone servers and for single exceptions.
+
+### Accepted deviations
+
+When a check is deliberately not followed on a machine, for example because another antivirus replaces Defender, list it in that machine's config:
+
+```json
+"hardening_exclude": ["DEF-*", "SMB-03"]
+```
+
+These checks then show as *Exception* in the report. They are not sent to DefectDojo, and `-Apply` doesn't change them. For exceptions on many machines, use DefectDojo's risk acceptance on the findings instead.
 
 ## Configuration (`C:\ProgramData\vulnagent\defectdojo.json`)
 
@@ -122,6 +210,9 @@ The `C:\ProgramData\vulnagent` folder is readable only by administrators, so a b
 | `close_old_findings` | `true` | Close findings that are no longer found. Skipped automatically when part of the scan failed. |
 | `minimum_severity` | `Info` | Don't import findings below this. |
 | `verify_tls` | `true` | `false` accepts any certificate (same as `-Insecure`). |
+| `hardening_engagement`, `hardening_test_title` | `hardening` | Where the hardening findings go in each product. |
+| `hardening_exclude` | `[]` | Hardening checks that are accepted deviations on this machine: IDs, patterns such as `"DEF-*"`, or areas such as `"Firewall"`. |
+| `hardening_include_passed` | `false` | Also send passed hardening checks, as Info, for a complete compliance record in DefectDojo. |
 
 ## Patching
 
@@ -158,5 +249,8 @@ On servers that WSUS or another patch tool already manages, leave it at `none` a
 | `DefectDojo returned HTTP 401` | Wrong API key in the config. |
 | `cannot reach DefectDojo` | Firewall: the server needs TCP 8080 (or 8443) to the DefectDojo server. |
 | `winget upgrade failed` | winget can't open its source as SYSTEM, which is common on Windows Server 2019. Set `include_winget` to `false`. |
+| `hardening.log`: `X still fails after the change (a Group Policy may set it back)` | A domain GPO sets this setting to another value. Change it in the GPO, or add the check to `hardening_exclude`. |
+| `hardening.log`: `the audit policy could not be read` | `auditpol.exe` failed. Run the script as administrator or SYSTEM. |
+| Defender checks missing from the hardening report | Defender is not the active antivirus (passive mode, or another antivirus). Check `DEF-01`. |
 
 **WSUS note:** with WSUS, "missing" means approved in WSUS and not yet installed. Updates that nobody has approved in WSUS don't appear. To compare against everything Microsoft has released, set `windows_update_source` to `windows_update`. The server then needs internet access to Windows Update.
