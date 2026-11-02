@@ -137,11 +137,34 @@ About 120 to 150 checks apply per machine:
 
 List the checks that apply to a machine with `vulnagent-harden.ps1 -List`.
 
+### CIS Benchmark numbers
+
+Each check also names the CIS Benchmark recommendations for the same setting, in the benchmark that matches the machine's Windows version:
+
+| Windows | CIS Benchmark |
+|---|---|
+| Server 2016 | CIS Microsoft Windows Server 2016 Benchmark v2.0.0 |
+| Server 2019 | CIS Microsoft Windows Server 2019 Benchmark v2.0.0 |
+| Server 2022 | CIS Microsoft Windows Server 2022 Benchmark v2.0.0 |
+| Server 2025 | CIS Microsoft Windows Server 2025 Benchmark v1.0.0 |
+| Windows 11 | CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0 |
+
+They appear as, for example, `2.3.11.7 (L1)` in the finding, the HTML report, `hardening.json` and `-List`. The level is L1 or L2, NG (Next Generation Windows Security, needs virtualization-based security) or BL (BitLocker). On servers, recommendations that CIS marks *DC only* or *MS only* are shown only on domain controllers or only on other servers. DefectDojo findings get the tag `cis-l1`, `cis-l2`, `cis-ng` or `cis-bl`.
+
+Keep in mind:
+
+- **The values are Microsoft's.** The CIS number says which recommendation covers the same setting. Where CIS and Microsoft differ, the check still wants the Microsoft value. For example, the script locks accounts after 3 wrong passwords, while CIS allows up to 5.
+- **Not every check has a CIS number.** About 20 checks have none, for example TLS 1.0/1.1, PowerShell 2.0, Secure Boot, BitLocker and Defender cloud protection. CIS Level 2 even turns cloud protection off. These checks say *no matching recommendation*.
+- **The numbers are for the versions above.** The mapping comes from the open-source [Wazuh CIS policies](https://github.com/wazuh/wazuh/tree/main/ruleset/sca/windows). Newer CIS releases sometimes renumber recommendations, so check the version when you compare with a newer benchmark PDF.
+- **Not shown on Windows 10 or on Server 2012 R2 and older.**
+
 ### In DefectDojo
 
-Each failed check becomes one finding in the machine's product, in the engagement **hardening**, with the check's severity. The description says why it matters, the expected value and the baseline setting. The mitigation shows the current value and how to fix it. Fixed checks close at the next run.
+Each failed check becomes one finding in the machine's product, in the engagement **hardening**, with the check's severity. The description says why it matters, the expected value, the baseline setting and the CIS recommendation. The mitigation shows the current value and how to fix it. Fixed checks close at the next run.
 
 Filter by the tag `hardening` to see all of them across the fleet. The tags `fix-safe`, `fix-review` and `fix-manual` say how each one can be fixed.
+
+DefectDojo doesn't update the description or tags of findings that are already open when it imports a new report. Findings created before the CIS numbers were added keep their old text until they close. To get the CIS numbers on all of them at once, delete the *hardening* test in the machine's *hardening* engagement in DefectDojo, then start the `vulnagent-hardening` task again.
 
 ### The HTML report
 
