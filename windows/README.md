@@ -17,6 +17,8 @@ Each run also writes a readable **HTML report** of everything it found: see [HTM
 
 A second script, **vulnagent-harden.ps1**, compares each machine with the **Microsoft security baseline** and reports every deviation to DefectDojo. It can also apply the recommended settings, with a backup and undo. See [Hardening](#hardening-microsoft-security-baseline).
 
+Without DefectDojo, use [vulnagent-local](../windows-local/README.md): the same checks, with the reports kept on each machine.
+
 Each machine becomes its own DefectDojo product under the product type **Windows servers**. Fixed findings close automatically, new ones are added, and notes and risk acceptances are kept, the same as on Linux.
 
 Defender antivirus signature updates are ignored. Non-security updates are left out unless you turn on `include_non_security_updates`.
@@ -137,34 +139,70 @@ About 120 to 150 checks apply per machine:
 
 List the checks that apply to a machine with `vulnagent-harden.ps1 -List`.
 
-### CIS Benchmark numbers
+### CIS Level 1 checks
 
-Each check also names the CIS Benchmark recommendations for the same setting, in the benchmark that matches the machine's Windows version:
+On top of the Microsoft baseline, the script checks the **CIS Benchmark Level 1** recommendations that the baseline doesn't cover. They have the IDs `CIS-001` to `CIS-205` and areas that start with *CIS* (`CIS security options`, `CIS user rights`, `CIS firewall`, `CIS audit`, `CIS admin templates`, `CIS Defender`, `CIS accounts`). They come from the CIS benchmarks below, and each one runs only where the machine's benchmark lists it:
 
-| Windows | CIS Benchmark |
+| Machine | CIS Level 1 checks added |
 |---|---|
-| Server 2016 | CIS Microsoft Windows Server 2016 Benchmark v2.0.0 |
-| Server 2019 | CIS Microsoft Windows Server 2019 Benchmark v2.0.0 |
-| Server 2022 | CIS Microsoft Windows Server 2022 Benchmark v2.0.0 |
-| Server 2025 | CIS Microsoft Windows Server 2025 Benchmark v1.0.0 |
-| Windows 11 | CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0 |
-
-They appear as, for example, `2.3.11.7 (L1)` in the finding, the HTML report, `hardening.json` and `-List`. The level is L1 or L2, NG (Next Generation Windows Security, needs virtualization-based security) or BL (BitLocker). On servers, recommendations that CIS marks *DC only* or *MS only* are shown only on domain controllers or only on other servers. DefectDojo findings get the tag `cis-l1`, `cis-l2`, `cis-ng` or `cis-bl`.
+| Server 2022, member server or DC | about 150, plus 30 for Defender |
+| Server 2025, member server or DC | about 155, plus 30 for Defender |
+| Server 2019, 2022 or 2025 not in a domain (Stand-alone benchmark) | about 125 to 140, plus 30 for Defender |
+| Server 2016, Server 2019 in a domain, Windows 11 | only the 30 Defender checks (there is no newer CIS benchmark for these here) |
 
 Keep in mind:
 
-- **The values are Microsoft's.** The CIS number says which recommendation covers the same setting. Where CIS and Microsoft differ, the check still wants the Microsoft value. For example, the script locks accounts after 3 wrong passwords, while CIS allows up to 5.
-- **Not every check has a CIS number.** About 20 checks have none, for example TLS 1.0/1.1, PowerShell 2.0, Secure Boot, BitLocker and Defender cloud protection. CIS Level 2 even turns cloud protection off. These checks say *no matching recommendation*.
-- **The numbers are for the versions above.** The mapping comes from the open-source [Wazuh CIS policies](https://github.com/wazuh/wazuh/tree/main/ruleset/sca/windows). Newer CIS releases sometimes renumber recommendations, so check the version when you compare with a newer benchmark PDF.
+- **A setting that isn't configured counts as failed**, as in a CIS audit, even where the Windows default would be the same. Expect the score to drop a lot the first time, until a CIS GPO or `-Apply cis` sets them.
+- **The value is the CIS one**, and the finding names the recommendation (and the STIG ID on Server 2019 and 2022). Severity comes from the STIG category where there is one (CAT II is Medium), otherwise Low.
+- **They are not applied by `-Apply safe` or `-Apply all`**, only by `-Apply cis` (see below). They haven't been reviewed one by one for side effects, so test them first.
+- **13 are by hand only**: renaming the Administrator and Guest accounts and the logon message (they need your input), and settings that can stop a server from working: the Windows Update install and restart policy, printer sharing (Print Spooler client connections), ignoring local firewall rules on the Public profile, and restricting Remote Desktop logon to Administrators.
+- **Not checked:** the per-user recommendations (CIS section 19, about 10 settings under `HKEY_USERS`), because the task runs as SYSTEM and can't see every user's settings reliably, and all Level 2 recommendations.
+- **Turn them off** with `"cis_checks": false` in the config, to compare only with the Microsoft baseline.
+
+### CIS Benchmark numbers and DISA STIG IDs
+
+Each check also names the CIS Benchmark recommendations for the same setting, in the benchmark that matches the machine. Servers that are not in a domain get the CIS *Stand-alone* benchmark where there is one:
+
+| Windows | In a domain (member server or DC) | Not in a domain | Source |
+|---|---|---|---|
+| Server 2016 | CIS Windows Server 2016 Benchmark v2.0.0 | same | Wazuh |
+| Server 2019 | CIS Windows Server 2019 Benchmark v2.0.0 | CIS Windows Server 2019 Stand-alone Benchmark v4.0.0 | Wazuh / CIS PDF |
+| Server 2022 | CIS Windows Server 2022 Benchmark v5.1.0 | CIS Windows Server 2022 Stand-alone Benchmark v2.0.0 | CIS PDF |
+| Server 2025 | CIS Windows Server 2025 Benchmark v2.1.1 | CIS Windows Server 2025 Stand-alone Benchmark v2.0.0 | CIS PDF |
+| Windows 11 | CIS Windows 11 Enterprise Benchmark v3.0.0 | same | Wazuh |
+
+Two more references are added where they apply:
+
+- **Defender:** the newer CIS server benchmarks moved all Microsoft Defender Antivirus settings into a separate benchmark. The Defender and attack surface reduction checks name their recommendation in the **CIS Microsoft Defender Antivirus Benchmark v1.0.0**, on every Windows version.
+- **DISA STIG:** on Server 2019 and 2022, each check also names the DISA STIG IDs for the same setting, with their category, for example `WN22-SO-000310 (CAT II)`. They come from the CIS STIG benchmarks: Server 2019 STIG V3R2 (CIS v3.0.0) and Server 2022 STIG V2R2 (CIS v2.0.0). There is no STIG mapping for Server 2025 yet.
+
+They appear in the finding, the HTML report, `hardening.json` (`cis`, `cis_defender`, `stig`) and `-List` (Defender numbers there start with `AV`). CIS numbers look like `2.3.11.7 (L1)`: the level is L1 or L2, NG (Next Generation Windows Security, needs virtualization-based security) or BL (BitLocker). On domain servers, recommendations and STIG IDs for domain controllers only or member servers only are shown only there. DefectDojo findings get the tags `cis-l1`, `cis-l2`, `cis-ng` or `cis-bl`, and `stig-cat-i`, `stig-cat-ii` or `stig-cat-iii`.
+
+Keep in mind:
+
+- **The values are Microsoft's.** The CIS number says which recommendation covers the same setting. Where CIS asks for another value, the check still wants the Microsoft one, and the finding and the HTML report say so under *CIS value*. This is the case for six checks:
+
+  | Check | Microsoft (what the check wants) | CIS |
+  |---|---|---|
+  | ACC-05 lockout threshold | 3 or fewer attempts | 5 or fewer |
+  | ACC-14 smart card removal | 1, lock the workstation | 1, 2 or 3 |
+  | LSA-09 LSA protection | 1 or 2 (with or without UEFI lock) | 1 only |
+  | SMB-08 lowest SMB version | SMB 3.0 (768) | SMB 3.1.1 (785), which blocks Windows 8.1 and Server 2012 R2 |
+  | SYS-04 boot-start drivers | 1, 3 or 8 | 3 only |
+  | UAC-02 admin elevation prompt | 2, ask for consent | 1 or 2 |
+
+- **Not every check has a CIS number.** On a Server 2022 or 2025 domain member, 15 to 17 checks have none: SSL 3.0, TLS 1.0/1.1 and .NET strong cryptography, PowerShell 2.0, Secure Boot, BitLocker, sudo, the stored auto-logon password, whether an antivirus runs at all, two attack surface reduction rules (web shells, PsExec and WMI), and the WDigest and Group Policy reprocessing settings, which CIS removed from its newer benchmarks (Server 2025 v2.1.1 also removed the LAN Manager hash setting). On Server 2022, three SMB settings that are new in Server 2025 have none either. These checks say *no matching recommendation*.
+- **CIS Level 1 is covered too.** The recommendations that no baseline check covers have their own checks, `CIS-001` and up: see [CIS Level 1 checks](#cis-level-1-checks).
+- **The numbers are for the versions above.** CIS renumbers recommendations between releases (for example, `LSA-03` is 2.3.11.7 in Server 2022 v5.1.0 but 2.3.11.6 in Server 2025 v2.1.1), so check the version when you compare with another benchmark PDF.
 - **Not shown on Windows 10 or on Server 2012 R2 and older.**
 
 ### In DefectDojo
 
-Each failed check becomes one finding in the machine's product, in the engagement **hardening**, with the check's severity. The description says why it matters, the expected value, the baseline setting and the CIS recommendation. The mitigation shows the current value and how to fix it. Fixed checks close at the next run.
+Each failed check becomes one finding in the machine's product, in the engagement **hardening**, with the check's severity. The description says why it matters, the expected value, the baseline setting, the CIS recommendation and, on Server 2019 and 2022, the DISA STIG ID. The mitigation shows the current value and how to fix it. Fixed checks close at the next run.
 
-Filter by the tag `hardening` to see all of them across the fleet. The tags `fix-safe`, `fix-review` and `fix-manual` say how each one can be fixed.
+Filter by the tag `hardening` to see all of them across the fleet. The tags `fix-safe`, `fix-review`, `fix-cis` and `fix-manual` say how each one can be fixed.
 
-DefectDojo doesn't update the description or tags of findings that are already open when it imports a new report. Findings created before the CIS numbers were added keep their old text until they close. To get the CIS numbers on all of them at once, delete the *hardening* test in the machine's *hardening* engagement in DefectDojo, then start the `vulnagent-hardening` task again.
+DefectDojo doesn't update the description or tags of findings that are already open when it imports a new report. Findings created before the CIS numbers or STIG IDs were added (or changed) keep their old text until they close. To get the current numbers on all of them at once, delete the *hardening* test in the machine's *hardening* engagement in DefectDojo, then start the `vulnagent-hardening` task again.
 
 ### The HTML report
 
@@ -178,7 +216,8 @@ Each check is marked:
 |---|---|---|
 | **safe** | Doesn't break a normal, current environment | `-Apply safe` |
 | **review** | Can break old clients, devices or applications. The finding says what. Test it on one machine first. | `-Apply all` |
-| **manual** | Needs hardware, Active Directory or a decision: Credential Guard, Secure Boot, BitLocker, LAPS, the auto-logon password | never automatic |
+| **cis** | A CIS Level 1 setting outside the Microsoft baseline. Not reviewed one by one: test it on one machine first. | `-Apply cis` |
+| **manual** | Needs hardware, Active Directory or a decision: Credential Guard, Secure Boot, BitLocker, LAPS, the auto-logon password, and 13 CIS settings | never automatic |
 
 ```powershell
 # see what would change, without changing anything
@@ -190,6 +229,10 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-h
 # apply selected "review" checks after testing them: by ID, ID pattern or area
 ... vulnagent-harden.ps1 -Apply all -Only SMB-03, SMB-04, LSA-03
 ... vulnagent-harden.ps1 -Apply all -Only Firewall -Exclude FW-01
+
+# apply CIS Level 1 checks after testing them: by ID or by CIS area
+... vulnagent-harden.ps1 -Apply cis -Only 'CIS security options' -DryRun
+... vulnagent-harden.ps1 -Apply cis -Only CIS-013, CIS-014, CIS-015
 
 # put back what the last -Apply changed (repeat to go back further)
 ... vulnagent-harden.ps1 -Undo last
@@ -236,6 +279,7 @@ These checks then show as *Exception* in the report. They are not sent to Defect
 | `hardening_engagement`, `hardening_test_title` | `hardening` | Where the hardening findings go in each product. |
 | `hardening_exclude` | `[]` | Hardening checks that are accepted deviations on this machine: IDs, patterns such as `"DEF-*"`, or areas such as `"Firewall"`. |
 | `hardening_include_passed` | `false` | Also send passed hardening checks, as Info, for a complete compliance record in DefectDojo. |
+| `cis_checks` | `true` | Also check the CIS Level 1 settings outside the Microsoft baseline (`CIS-001` and up). |
 
 ## Patching
 

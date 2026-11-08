@@ -15,7 +15,9 @@
     that need a newer Windows than the machine runs are skipped.
 
     Each check also names the CIS Benchmark recommendations for the same
-    setting (Server 2016 to 2025 and Windows 11), for audits against CIS.
+    setting (Server 2016 to 2025, the Stand-alone benchmarks for servers
+    outside a domain, Windows 11 and the Defender Antivirus benchmark), and
+    the DISA STIG IDs on Server 2019 and 2022, for audits against CIS or STIG.
 
     Without -Apply the script only reads. Each run:
 
@@ -28,13 +30,19 @@
       * writes an HTML report to
         C:\ProgramData\vulnagent\reports\hardening.html (and to -Html).
 
+    On Server 2022 and 2025, and Server 2019 outside a domain, about 155 to
+    185 more checks cover the CIS Benchmark Level 1 recommendations that are not
+    in the Microsoft baseline (IDs CIS-001 and up; 30 of them for Defender on
+    every Windows version). Turn them off with "cis_checks": false.
+
     Every check is marked:
       safe    can be applied without breaking a normal, current environment
       review  can break old clients or applications: test first
+      cis     a CIS Level 1 setting outside the Microsoft baseline: test first
       manual  needs hardware, Active Directory or a decision (not automatic)
 
     -Apply safe changes the failed "safe" checks, -Apply all also the "review"
-    ones. Before a change the old value is saved to
+    ones, -Apply cis the failed "cis" ones. Before a change the old value is saved to
     C:\ProgramData\vulnagent\hardening\backup-<time>.json, and -Undo puts it
     back. In a domain, settings that a Group Policy sets win over local
     changes: apply the Microsoft baseline GPOs there instead.
@@ -62,6 +70,10 @@
     Apply the failed SMB checks and LSA-03, including "review" ones.
 
 .EXAMPLE
+    vulnagent-harden.ps1 -Apply cis -Only 'CIS firewall', CIS-012 -DryRun
+    Show what the CIS firewall checks and CIS-012 would change.
+
+.EXAMPLE
     vulnagent-harden.ps1 -Undo last
     Put back the values that the last -Apply changed.
 
@@ -78,7 +90,7 @@ param(
     [switch]$DryRun,
     [string]$Output,
     [string]$Html,
-    [ValidateSet('safe', 'all')][string]$Apply,
+    [ValidateSet('safe', 'all', 'cis')][string]$Apply,
     [string[]]$Only,
     [string[]]$Exclude,
     [string]$Undo,
@@ -104,6 +116,7 @@ $DefaultConfig = [ordered]@{
     minimum_severity         = 'Info'
     hardening_exclude        = @()                # accepted deviations: check IDs (wildcards allowed)
     hardening_include_passed = $false             # also send passed checks, as Info
+    cis_checks               = $true              # also check the CIS Level 1 settings outside the Microsoft baseline
     verify_tls               = $true
     timeout                  = 600
 }
@@ -208,204 +221,911 @@ function Get-BaselineName($H) {
     'Microsoft security baseline Windows 11 v25H2'
 }
 
-# CIS Benchmark recommendations that cover the same setting as each check, taken from
-# the Wazuh CIS policies (github.com/wazuh/wazuh, ruleset/sca/windows). The value a check
-# wants is the Microsoft one, which can be stricter or looser than the CIS one.
-# Level L1 unless marked: /L2, /NG (next generation, needs VBS), /BL (BitLocker).
-# !dc and !ms: only on domain controllers / only on member and standalone servers.
+# CIS Benchmark recommendations and DISA STIG IDs that cover the same setting as each check.
+# Read from the CIS benchmark PDFs: Server 2019 Stand-alone v4.0.0, Server 2022 v5.1.0 and
+# Stand-alone v2.0.0, Server 2025 v2.1.1 and Stand-alone v2.0.0, Defender Antivirus v1.0.0, and
+# the CIS STIG benchmarks for Server 2019 (v3.0.0) and 2022 (v2.0.0) for the STIG IDs. Server 2016,
+# Server 2019 in a domain and Windows 11 come from the Wazuh CIS policies (github.com/wazuh/wazuh,
+# ruleset/sca/windows). The value a check wants is the Microsoft one; $CisNotes says where CIS
+# asks for another value.
+# Cells: CIS level L1 unless marked /L2, /NG (next generation, needs VBS) or /BL (BitLocker);
+# STIG IDs carry their category: /I, /II, /III. !dc and !ms: only on domain controllers / only on
+# the other servers. '=' is the same as the column to the left. Columns, in this order:
+# ws2016 ws2019 ws2019sa ws2022 ws2022sa ws2025 ws2025sa win11 defender stig2019 stig2022.
 $CisBenchmarks = [ordered]@{
-    ws2016 = 'CIS Microsoft Windows Server 2016 Benchmark v2.0.0'
-    ws2019 = 'CIS Microsoft Windows Server 2019 Benchmark v2.0.0'
-    ws2022 = 'CIS Microsoft Windows Server 2022 Benchmark v2.0.0'
-    ws2025 = 'CIS Microsoft Windows Server 2025 Benchmark v1.0.0'
-    win11  = 'CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0'
+    ws2016   = 'CIS Microsoft Windows Server 2016 Benchmark v2.0.0'
+    ws2019   = 'CIS Microsoft Windows Server 2019 Benchmark v2.0.0'
+    ws2019sa = 'CIS Microsoft Windows Server 2019 Stand-alone Benchmark v4.0.0'
+    ws2022   = 'CIS Microsoft Windows Server 2022 Benchmark v5.1.0'
+    ws2022sa = 'CIS Microsoft Windows Server 2022 Stand-alone Benchmark v2.0.0'
+    ws2025   = 'CIS Microsoft Windows Server 2025 Benchmark v2.1.1'
+    ws2025sa = 'CIS Microsoft Windows Server 2025 Stand-alone Benchmark v2.0.0'
+    win11    = 'CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0'
+    defender = 'CIS Microsoft Defender Antivirus Benchmark v1.0.0'
+    stig2019 = 'DISA STIG Windows Server 2019 V3R2 (CIS Windows Server 2019 STIG Benchmark v3.0.0)'
+    stig2022 = 'DISA STIG Windows Server 2022 V2R2 (CIS Windows Server 2022 STIG Benchmark v2.0.0)'
 }
 $CisTable = @'
-# check ws2016                                              ws2019                                              ws2022                                              ws2025                                                win11
-SMB-01  18.4.4                                              18.4.4                                              18.4.4                                              18.4.3                                                18.4.4
-SMB-02  18.4.3                                              18.4.3                                              18.4.3                                              18.4.2                                                18.4.3
-SMB-03  -                                                   2.3.9.2                                             2.3.9.2                                             2.3.9.2                                               2.3.9.2
-SMB-04  2.3.8.1,2.3.9.2                                     2.3.8.1                                             2.3.8.1                                             2.3.8.1                                               2.3.8.1
-SMB-05  2.3.8.3                                             2.3.8.3                                             2.3.8.3                                             2.3.8.3                                               2.3.8.3
-SMB-06  18.6.8.1                                            18.6.8.1                                            18.6.8.1                                            18.6.8.5                                              18.6.8.1
-SMB-07  2.3.10.10                                           2.3.10.10                                           2.3.10.10                                           2.3.10.10                                             2.3.10.9
-SMB-08  -                                                   -                                                   -                                                   18.6.7.5,18.6.8.7                                     -
-SMB-09  -                                                   -                                                   -                                                   18.6.7.6,18.6.8.4                                     -
-SMB-10  -                                                   -                                                   -                                                   18.6.7.1,18.6.7.2,18.6.7.3,18.6.8.1,18.6.8.2,18.6.8.3 -
-SMB-11  -                                                   -                                                   -                                                   18.6.7.4,18.6.8.6                                     -
-NET-01  18.6.4.2                                            18.6.4.2                                            18.6.4.3                                            18.6.4.4                                              18.6.4.3
-NET-02  18.6.4.1                                            18.6.4.1                                            18.6.4.2                                            18.6.4.2                                              18.6.4.2
-NET-03  18.4.7                                              18.4.6                                              18.4.6                                              18.4.6                                                18.4.7
-NET-04  18.5.6                                              18.5.6                                              18.5.6                                              18.5.6                                                18.5.7
-NET-05  18.5.2,18.5.3                                       18.5.2,18.5.3                                       18.5.2,18.5.3                                       18.5.2,18.5.3                                         18.5.2,18.5.3
-NET-06  18.5.4                                              18.5.4                                              18.5.4                                              18.5.4                                                18.5.5
-NET-07  18.6.14.1                                           -                                                   18.6.14.1                                           18.6.14.1                                             18.6.14.1
-NET-08  2.3.11.8                                            2.3.11.8                                            2.3.11.8                                            2.3.11.9                                              2.3.11.8
-NET-09  18.9.35.2/L2!ms                                     18.9.35.2/L2!ms                                     18.9.35.2/L2!ms                                     18.9.36.2/L2!ms                                       18.9.36.2
-LSA-01  18.4.8                                              18.4.7                                              18.4.7                                              18.4.7                                                18.4.8
-LSA-02  2.3.11.5                                            2.3.11.5                                            2.3.11.5                                            2.3.11.5                                              2.3.11.5
-LSA-03  2.3.11.7                                            2.3.11.7                                            2.3.11.7                                            2.3.11.7                                              2.3.11.7
-LSA-04  2.3.11.9,2.3.11.10                                  2.3.11.9,2.3.11.10                                  2.3.11.9,2.3.11.10                                  2.3.11.10,2.3.11.11                                   2.3.11.9,2.3.11.10
-LSA-05  2.3.10.2!ms,2.3.10.3!ms                             2.3.10.2!ms,2.3.10.3!ms                             2.3.10.2!ms,2.3.10.3!ms                             2.3.10.2!ms,2.3.10.3!ms                               2.3.10.2,2.3.10.3
-LSA-06  2.3.10.11!ms                                        2.3.10.11!ms                                        2.3.10.11!ms                                        2.3.10.11!ms                                          2.3.10.10
-LSA-07  2.3.11.2                                            2.3.11.2                                            2.3.11.2                                            2.3.11.2                                              2.3.11.2
-LSA-08  2.3.1.3                                             2.3.1.3                                             2.3.1.3                                             2.3.1.2                                               2.3.1.3
-LSA-09  18.4.6                                              18.9.25.1/NG                                        18.9.25.2/NG                                        18.9.26.2/NG                                          18.9.26.2
-LSA-10  18.9.4.2                                            18.9.4.2                                            18.9.4.2                                            18.9.4.2                                              18.9.4.2
-LSA-11  18.9.4.1                                            18.9.4.1                                            18.9.4.1                                            18.9.4.1                                              18.9.4.1
-LSA-12  -                                                   -                                                   -                                                   2.3.11.12,2.3.11.14                                   2.3.11.11,2.3.11.12
-LSA-13  18.9.5.5/NG!ms                                      18.9.5.5/NG!ms                                      18.9.5.5/NG!ms                                      18.9.5.5/NG!ms                                        18.9.5.5
-UAC-01  2.3.17.6                                            2.3.17.6                                            2.3.17.6                                            2.3.17.6                                              2.3.17.6
-UAC-02  2.3.17.2                                            2.3.17.2                                            2.3.17.2                                            2.3.17.2                                              2.3.17.2
-UAC-03  2.3.17.3                                            2.3.17.3                                            2.3.17.3                                            2.3.17.3                                              2.3.17.3
-UAC-04  2.3.17.1                                            2.3.17.1                                            2.3.17.1                                            2.3.17.1                                              2.3.17.1
-UAC-05  2.3.17.4,2.3.17.5,2.3.17.8                          2.3.17.4,2.3.17.5,2.3.17.8                          2.3.17.4,2.3.17.5,2.3.17.8                          2.3.17.4,2.3.17.5,2.3.17.8                            2.3.17.4,2.3.17.5,2.3.17.8
-UAC-06  18.4.1!ms                                           18.4.1!ms                                           18.4.1!ms                                           18.4.1!ms                                             18.4.1
-ACC-01  1.1.4                                               1.1.4                                               1.1.4                                               1.1.4                                                 1.1.4
-ACC-02  1.1.5                                               1.1.5                                               1.1.5                                               1.1.5                                                 1.1.5
-ACC-03  1.1.1                                               -                                                   1.1.1                                               1.1.1                                                 1.1.1
-ACC-04  1.1.6                                               1.1.6                                               1.1.7                                               1.1.7                                                 1.1.7
-ACC-05  1.2.2                                               1.2.2                                               1.2.2                                               1.2.2                                                 1.2.2
-ACC-06  1.2.1                                               1.2.1                                               1.2.1                                               1.2.1                                                 1.2.1
-ACC-07  1.2.3                                               1.2.3                                               1.2.3                                               1.2.3!ms                                              1.2.3
-ACC-08  2.3.1.2!ms                                          2.3.1.2!ms                                          2.3.1.2!ms                                          2.3.1.1!ms                                            2.3.1.2
-ACC-09  2.3.10.1                                            2.3.10.1                                            2.3.10.1                                            2.3.10.1                                              2.3.10.1
-ACC-10  2.3.7.3                                             2.3.7.3                                             2.3.7.3                                             2.3.7.3                                               2.3.7.4
-ACC-11  18.10.82.1                                          18.10.82.1                                          18.10.82.2                                          18.10.82.2                                            18.10.81.2
-ACC-12  -                                                   -                                                   -                                                   -                                                     -
-ACC-13  18.3.3!ms                                           18.3.3!ms                                           18.3.3!ms                                           18.9.25.1                                             18.9.25.1
-ACC-14  2.3.7.9                                             2.3.7.9                                             2.3.7.9                                             2.3.7.9                                               2.3.7.9
-URA-01  2.2.4                                               2.2.4                                               2.2.4                                               2.2.4                                                 2.2.3
-URA-02  2.2.14                                              2.2.14                                              2.2.14                                              2.2.15                                                2.2.11
-URA-03  2.2.1                                               2.2.1                                               2.2.1                                               2.2.1                                                 2.2.1
-URA-04  2.2.19                                              2.2.19                                              2.2.19                                              2.2.20                                                2.2.15
-URA-05  2.2.34                                              2.2.34                                              2.2.34                                              2.2.35                                                2.2.26
-URA-06  2.2.48                                              2.2.48                                              2.2.48                                              2.2.49                                                2.2.39
-URA-07  2.2.38!ms                                           2.2.38!ms                                           2.2.38!ms                                           2.2.38!dc,2.2.39!ms                                   2.2.30
-URA-08  2.2.10                                              2.2.10                                              2.2.10                                              2.2.11                                                2.2.7
-URA-09  2.2.45                                              2.2.45                                              2.2.45                                              2.2.46                                                2.2.37
-URA-10  2.2.40                                              2.2.40                                              2.2.40                                              2.2.41                                                2.2.32
-URA-11  2.2.35                                              2.2.35                                              2.2.35                                              2.2.36                                                2.2.27
-URA-12  2.2.16                                              2.2.16                                              2.2.16                                              2.2.17                                                2.2.13
-URA-13  2.2.27!dc,2.2.28!ms                                 2.2.27!dc,2.2.28!ms                                 2.2.27!dc,2.2.28!ms                                 2.2.28!dc,2.2.29!ms                                   2.2.21
-URA-14  2.2.20!dc,2.2.21!ms                                 2.2.20!dc,2.2.21!ms                                 2.2.20!dc,2.2.21!ms                                 2.2.21!dc,2.2.22!ms                                   2.2.16
-URA-15  2.2.25!dc,2.2.26!ms                                 2.2.25!dc,2.2.26!ms                                 2.2.25!dc,2.2.26!ms                                 2.2.26!dc,2.2.27!ms                                   2.2.20
-URA-16  2.2.2!dc,2.2.3!ms                                   2.2.2!dc,2.2.3!ms                                   2.2.2!dc,2.2.3!ms                                   2.2.2!dc,2.2.3!ms                                     2.2.2
-URA-17  2.2.7                                               2.2.7                                               2.2.7                                               2.2.7!dc,2.2.8!ms                                     2.2.5
-AUD-01  17.1.1                                              17.1.1                                              17.1.1                                              17.1.1                                                17.1.1
-AUD-02  17.2.5                                              17.2.5                                              17.2.5                                              17.2.5                                                17.2.2
-AUD-03  17.2.6                                              17.2.6                                              17.2.6                                              17.2.6                                                17.2.3
-AUD-04  17.3.1                                              17.3.1                                              17.3.1                                              17.3.1                                                17.3.1
-AUD-05  17.3.2                                              17.3.2                                              17.3.2                                              17.3.2                                                17.3.2
-AUD-06  17.5.1                                              17.5.1                                              17.5.1                                              17.5.1                                                17.5.1
-AUD-07  17.5.2                                              17.5.2                                              17.5.2                                              17.5.2                                                17.5.2
-AUD-08  17.5.4                                              17.5.4                                              17.5.4                                              17.5.4                                                17.5.4
-AUD-09  17.5.5                                              17.5.5                                              17.5.5                                              17.5.5                                                17.5.5
-AUD-10  17.5.6                                              17.5.6                                              17.5.6                                              17.5.6                                                17.5.6
-AUD-11  17.6.1                                              17.6.1                                              17.6.1                                              17.6.1                                                17.6.1
-AUD-12  17.6.2                                              17.6.2                                              17.6.2                                              17.6.2                                                17.6.2
-AUD-13  17.6.3                                              17.6.3                                              17.6.3                                              17.6.3                                                17.6.3
-AUD-14  17.6.4                                              17.6.4                                              17.6.4                                              17.6.4                                                17.6.4
-AUD-15  17.7.1                                              17.7.1                                              17.7.1                                              17.7.1                                                17.7.1
-AUD-16  17.7.2                                              17.7.2                                              17.7.2                                              17.7.2                                                17.7.2
-AUD-17  17.7.4                                              17.7.4                                              17.7.4                                              17.7.4                                                17.7.4
-AUD-18  17.7.5                                              17.7.5                                              17.7.5                                              17.7.5                                                17.7.5
-AUD-19  17.8.1                                              17.8.1                                              17.8.1                                              17.8.1                                                17.8.1
-AUD-20  17.9.2                                              17.9.2                                              17.9.2                                              17.9.2                                                17.9.2
-AUD-21  17.9.3                                              17.9.3                                              17.9.3                                              17.9.3                                                17.9.3
-AUD-22  17.9.4                                              17.9.4                                              17.9.4                                              17.9.4                                                17.9.4
-AUD-23  17.9.5                                              17.9.5                                              17.9.5                                              17.9.5                                                17.9.5
-AUD-24  17.7.3                                              17.7.3                                              17.7.3                                              17.7.3                                                17.7.3
-AUD-40  2.3.2.1                                             2.3.1.5                                             2.3.2.1                                             2.3.2.1                                               2.3.2.1
-AUD-41  18.9.3.1                                            18.9.3.1                                            18.9.3.1                                            18.9.3.1                                              18.9.3.1
-AUD-42  18.10.87.1                                          18.10.87.1                                          18.10.87.1                                          18.10.87.1/L2                                         18.10.86.1/L2
-AUD-43  18.10.26.1.2,18.10.26.2.2,18.10.26.3.2,18.10.26.4.2 18.10.26.1.2,18.10.26.2.2,18.10.26.3.2,18.10.26.4.2 18.10.26.1.2,18.10.26.2.2,18.10.26.3.2,18.10.26.4.2 18.10.26.1.2,18.10.26.2.2,18.10.26.3.2,18.10.26.4.2   18.10.25.1.2,18.10.25.2.2,18.10.25.3.2,18.10.25.4.2
-DEF-01  18.10.43.17                                         18.10.43.17                                         18.10.43.17                                         -                                                     18.10.42.17
-DEF-02  18.10.43.10.2                                       18.10.43.10.2                                       18.10.43.10.2                                       18.10.43.10.3                                         18.10.42.10.2
-DEF-03  18.10.43.10.3                                       18.10.43.10.3                                       18.10.43.10.3                                       18.10.43.10.4                                         18.10.42.10.3
-DEF-04  18.10.43.10.1                                       18.10.43.10.1                                       18.10.43.10.1                                       18.10.43.10.2                                         18.10.42.10.1
-DEF-05  18.10.43.10.4                                       18.10.43.10.4                                       18.10.43.10.4                                       18.10.43.10.5                                         18.10.42.10.4
-DEF-06  -                                                   -                                                   -                                                   -                                                     -
-DEF-07  -                                                   -                                                   -                                                   -                                                     -
-DEF-08  -                                                   -                                                   -                                                   -                                                     -
-DEF-09  -                                                   -                                                   -                                                   -                                                     -
-DEF-10  18.10.43.16                                         18.10.43.16                                         18.10.43.16                                         18.10.43.16                                           18.10.42.16
-DEF-11  18.10.43.13.1                                       18.10.43.13.1                                       18.10.43.13.1                                       18.10.43.13.3                                         18.10.42.13.2
-DEF-12  18.10.43.6.3.1                                      18.10.43.6.3.1                                      18.10.43.6.3.1                                      18.10.43.6.3.1                                        18.10.42.6.3.1
-DEF-21  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-22  -                                                   -                                                   -                                                   -                                                     -
-DEF-23  -                                                   -                                                   -                                                   -                                                     -
-DEF-24  -                                                   -                                                   -                                                   -                                                     -
-DEF-25  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-26  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-27  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-28  -                                                   -                                                   -                                                   -                                                     -
-DEF-29  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-30  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-31  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-32  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-33  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-34  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-35  18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                      18.10.43.6.1.2                                        18.10.42.6.1.2
-DEF-36  -                                                   -                                                   -                                                   -                                                     -
-FW-01   9.1.1,9.1.2                                         9.1.1,9.1.2                                         9.1.1,9.1.2                                         9.1.1,9.1.2                                           9.1.1,9.1.2
-FW-02   9.2.1,9.2.2                                         9.2.1,9.2.2                                         9.2.1,9.2.2                                         9.2.1,9.2.2                                           9.2.1,9.2.2
-FW-03   9.3.1,9.3.2                                         9.3.1,9.3.2                                         9.3.1,9.3.2                                         9.3.1,9.3.2                                           9.3.1,9.3.2
-FW-04   9.1.7,9.1.8,9.2.7,9.2.8,9.3.9,9.3.10                9.1.7,9.1.8,9.2.7,9.2.8,9.3.9,9.3.10                9.1.7,9.1.8,9.2.7,9.2.8,9.3.9,9.3.10                9.1.6,9.1.7,9.2.6,9.2.7,9.3.8,9.3.9                   9.1.6,9.1.7,9.2.6,9.2.7,9.3.8,9.3.9
-RDP-01  18.10.57.3.9.4                                      18.10.57.3.9.4                                      18.10.57.3.9.4                                      18.10.57.3.9.4                                        18.10.56.3.9.4
-RDP-02  18.10.57.3.9.2,18.10.57.3.9.5                       18.10.57.3.9.2,18.10.57.3.9.5                       18.10.57.3.9.2,18.10.57.3.9.5                       18.10.57.3.9.2,18.10.57.3.9.5                         18.10.56.3.9.2,18.10.56.3.9.5
-RDP-03  18.10.57.2.2                                        18.10.57.2.2                                        18.10.57.2.2                                        18.10.57.2.2                                          18.10.56.2.3
-RDP-04  18.10.57.3.9.1                                      18.10.57.3.9.1                                      18.10.57.3.9.1                                      18.10.57.3.9.1                                        18.10.56.3.9.1
-RDP-05  18.10.57.3.3.2                                      18.10.57.3.3.2                                      18.10.57.3.3.3                                      18.10.57.3.3.3                                        18.10.56.3.3.3
-RDP-06  18.9.34.2                                           18.9.34.2                                           18.9.34.2                                           18.9.35.2                                             18.9.35.2
-WRM-01  18.10.89.2.1,18.10.89.2.3                           18.10.89.2.1,18.10.89.2.3                           18.10.89.2.1,18.10.89.2.3                           18.10.89.2.1,18.10.89.2.3                             18.10.88.2.1,18.10.88.2.3
-WRM-02  18.10.89.1.1,18.10.89.1.2,18.10.89.1.3              18.10.89.1.1,18.10.89.1.2,18.10.89.1.3              18.10.89.1.1,18.10.89.1.2,18.10.89.1.3              18.10.89.1.1,18.10.89.1.2,18.10.89.1.3                18.10.88.1.1,18.10.88.1.2,18.10.88.1.3
-WRM-03  18.10.89.2.4                                        18.10.89.2.4                                        18.10.89.2.4                                        18.10.89.2.4                                          18.10.88.2.4
-SYS-01  18.10.7.1,18.10.7.2,18.10.7.3                       18.10.7.1,18.10.7.2,18.10.7.3                       18.10.7.1,18.10.7.2,18.10.7.3                       18.10.8.1,18.10.8.2,18.10.8.3                         18.10.7.1,18.10.7.2,18.10.7.3
-SYS-02  18.10.81.1,18.10.81.2                               18.10.81.1,18.10.81.2                               18.10.81.1,18.10.81.2                               18.10.81.1,18.10.81.2                                 18.10.80.1,18.10.80.2
-SYS-03  18.4.5                                              18.4.5                                              18.4.5                                              18.4.5                                                18.4.6
-SYS-04  18.9.13.1                                           18.9.13.1                                           18.9.13.1                                           18.9.13.1                                             18.9.13.1
-SYS-05  2.3.15.2                                            2.3.15.2                                            2.3.15.2                                            2.3.15.2                                              2.3.15.2
-SYS-06  -                                                   18.9.24.1                                           18.9.24.1                                           18.9.24.1                                             18.9.24.1/BL
-SYS-07  18.10.76.2.1                                        18.10.76.2.1                                        18.10.76.2.1                                        18.10.76.2.1                                          18.10.75.2.1
-SYS-08  -                                                   -                                                   -                                                   18.10.29.2                                            -
-SYS-09  -                                                   -                                                   -                                                   -                                                     -
-SYS-10  18.10.59.3                                          18.10.59.3                                          18.10.59.3                                          18.10.59.3                                            18.10.58.5
-SYS-11  18.9.27.4!ms                                        18.9.27.4!ms                                        18.9.27.4!ms                                        18.9.28.4!ms                                          18.9.28.4
-SYS-12  18.7.8                                              18.7.8                                              18.7.8                                              18.7.10                                               18.7.8
-SYS-13  18.4.2                                              18.4.2                                              18.4.2                                              18.7.8                                                18.4.2
-SYS-14  18.9.19.2,18.9.19.3                                 18.9.19.2,18.9.19.3                                 18.9.19.2,18.9.19.3                                 18.9.19.2,18.9.19.3                                   18.9.19.2,18.9.19.3
-SYS-15  5.1!dc                                              5.1!dc                                              5.1!dc                                              5.1!dc                                                -
-SYS-16  5.2/L2!ms                                           5.2/L2!ms                                           5.2/L2!ms                                           5.2/L2!ms                                             -
-SYS-17  -                                                   -                                                   -                                                   -                                                     -
-SYS-18  -                                                   -                                                   -                                                   -                                                     -
-SYS-19  -                                                   -                                                   -                                                   -                                                     -
-TLS-01  -                                                   -                                                   -                                                   -                                                     -
-TLS-02  -                                                   -                                                   -                                                   -                                                     -
-TLS-03  -                                                   -                                                   -                                                   -                                                     -
-TLS-04  -                                                   -                                                   -                                                   -                                                     -
-AUD-25  17.1.2!dc                                           17.1.2!dc                                           17.1.2!dc                                           17.1.2!dc                                             -
-AUD-26  17.1.3!dc                                           17.1.3!dc                                           17.1.3!dc                                           17.1.3!dc                                             -
-AUD-27  17.2.2!dc                                           17.2.2!dc                                           17.2.2!dc                                           17.2.2!dc                                             -
-AUD-28  17.2.4!dc                                           17.2.4!dc                                           17.2.4!dc                                           17.2.4!dc                                             -
-AUD-29  17.4.1!dc                                           17.4.1!dc                                           17.4.1!dc                                           17.4.1!dc                                             -
-AUD-30  17.4.2!dc                                           17.4.2!dc                                           17.4.2!dc                                           17.4.2!dc                                             -
+# check ws2016 ws2019 ws2019sa ws2022 ws2022sa ws2025 ws2025sa win11 defender stig2019 stig2022
+SMB-01  18.4.4 = 18.4.3 = 18.4.2 18.4.3 18.4.2 18.4.4 - WN19-00-000390/II WN22-00-000390/II
+SMB-02  18.4.3 = 18.4.2 = 18.4.1 18.4.2 18.4.1 18.4.3 - WN19-00-000400/II WN22-00-000400/II
+SMB-03  - 2.3.9.2 = = = = = = - WN19-SO-000190/II WN22-SO-000190/II
+SMB-04  2.3.8.1,2.3.9.2 2.3.8.1 = = = = = = - WN19-SO-000160/II WN22-SO-000160/II
+SMB-05  2.3.8.3 = 2.3.8.2 = = = = 2.3.8.3 - WN19-SO-000180/II WN22-SO-000180/II
+SMB-06  18.6.8.1 = = = = 18.6.8.4 = 18.6.8.1 - WN19-CC-000070/II WN22-CC-000070/II
+SMB-07  2.3.10.10 = 2.3.10.9 2.3.10.10 2.3.10.9 2.3.10.10 2.3.10.9 = - WN19-SO-000250/I WN22-SO-000250/II
+SMB-08  - - - 18.6.7.1 = 18.6.7.6,18.6.8.6 = - - - -
+SMB-09  - - - - - 18.6.7.4,18.6.7.7 = - - - -
+SMB-10  - - - - - 18.6.7.1,18.6.7.2,18.6.7.3,18.6.8.1,18.6.8.2,18.6.8.3 = - - - -
+SMB-11  - - - - - 18.6.7.5,18.6.8.5 = - - - -
+NET-01  18.6.4.2 = 18.6.4.4 = - 18.6.4.4 - 18.6.4.3 - - -
+NET-02  18.6.4.1 = 18.6.4.2 = - 18.6.4.2 - 18.6.4.2 - - -
+NET-03  18.4.7 18.4.6 18.4.7 18.4.6 18.4.5 18.4.6 18.4.5 18.4.7 - - -
+NET-04  18.5.6 = = = = = = 18.5.7 - WN19-CC-000060/III WN22-CC-000060/II
+NET-05  18.5.2,18.5.3 = = = = = = = - WN19-CC-000030/III,WN19-CC-000040/III WN22-CC-000030/II,WN22-CC-000040/II
+NET-06  18.5.4 = = = = = = 18.5.5 - WN19-CC-000050/III WN22-CC-000050/II
+NET-07  18.6.14.1 - 18.6.14.1 = = = = = - WN19-CC-000080/II WN22-CC-000080/II
+NET-08  2.3.11.8 = = = = = = = - WN19-SO-000320/II WN22-SO-000320/II
+NET-09  18.9.35.2/L2!ms = 18.9.38.2/L2 18.9.38.2/L2!ms 18.9.38.2/L2 18.9.38.2/L2!ms 18.9.38.2/L2 18.9.36.2 - WN19-MS-000040/II!ms WN22-MS-000040/II!ms
+LSA-01  18.4.8 18.4.7 18.4.8 - - - - 18.4.8 - WN19-CC-000020/II WN22-CC-000020/II
+LSA-02  2.3.11.5 = = = = - - 2.3.11.5 - WN19-SO-000300/I WN22-SO-000300/I
+LSA-03  2.3.11.7 = = = = 2.3.11.6 = 2.3.11.7 - WN19-SO-000310/I WN22-SO-000310/II
+LSA-04  2.3.11.9,2.3.11.10 = = = = = = = - WN19-SO-000330/II,WN19-SO-000340/II WN22-SO-000330/II,WN22-SO-000340/II
+LSA-05  2.3.10.2!ms,2.3.10.3!ms = 2.3.10.2,2.3.10.3 2.3.10.2!ms,2.3.10.3!ms 2.3.10.2,2.3.10.3 2.3.10.2!ms,2.3.10.3!ms 2.3.10.2,2.3.10.3 = - WN19-SO-000220/I,WN19-SO-000230/I WN22-SO-000220/I,WN22-SO-000230/I
+LSA-06  2.3.10.11!ms = 2.3.10.10 2.3.10.11!ms 2.3.10.10 2.3.10.11!ms 2.3.10.10 = - WN19-MS-000060/II!ms WN22-MS-000060/II!ms
+LSA-07  2.3.11.2 = = = = = = = - WN19-SO-000270/II WN22-SO-000270/II
+LSA-08  2.3.1.3 = 2.3.1.2 = = = = 2.3.1.3 - WN19-SO-000020/I WN22-SO-000020/II
+LSA-09  18.4.6 18.9.25.1/NG 18.4.6 18.9.27.2/NG 18.9.27.1/NG 18.9.27.2/NG 18.9.27.1/NG 18.9.26.2 - - -
+LSA-10  18.9.4.2 = = = = = = = - WN19-CC-000100/II WN22-CC-000100/II
+LSA-11  18.9.4.1 = = = = = = = - - -
+LSA-12  - - 2.3.11.11,2.3.11.12 2.3.11.11,2.3.11.13 2.3.11.11,2.3.11.12 2.3.11.11,2.3.11.13 2.3.11.11,2.3.11.12 = - - -
+LSA-13  18.9.5.5/NG!ms = 18.9.5.5/NG 18.9.5.5/NG!ms 18.9.5.5/NG 18.9.5.5/NG!ms 18.9.5.5/NG 18.9.5.5 - - WN22-MS-000140/II!ms
+UAC-01  2.3.17.6 = = = = = = = - WN19-SO-000440/II WN22-SO-000440/II
+UAC-02  2.3.17.2 = = = = = = = - WN19-SO-000400/II WN22-SO-000400/II
+UAC-03  2.3.17.3 = = = = = = = - WN19-SO-000410/II WN22-SO-000410/II
+UAC-04  2.3.17.1 = = = = = = = - WN19-SO-000380/II WN22-SO-000380/II
+UAC-05  2.3.17.4,2.3.17.5,2.3.17.8 = = = = = = = - WN19-SO-000420/II,WN19-SO-000430/II,WN19-SO-000450/II WN22-SO-000420/II,WN22-SO-000430/II,WN22-SO-000450/II
+UAC-06  18.4.1!ms = 18.4.1 18.4.1!ms - 18.4.1!ms - 18.4.1 - WN19-MS-000020/II!ms WN22-MS-000020/II!ms
+ACC-01  1.1.4 = = = = = = = - WN19-AC-000070/II WN22-AC-000070/II
+ACC-02  1.1.5 = = = = = = = - WN19-AC-000080/II WN22-AC-000080/II
+ACC-03  1.1.1 - 1.1.1 = = = = = - WN19-AC-000040/II WN22-AC-000040/II
+ACC-04  1.1.6 = = 1.1.7 = = = = - WN19-AC-000090/I WN22-AC-000090/I
+ACC-05  1.2.2 = = = = = = = - WN19-AC-000020/II WN22-AC-000020/II
+ACC-06  1.2.1,1.2.4 = = = = = = = - WN19-AC-000010/II,WN19-AC-000030/II WN22-AC-000010/II,WN22-AC-000030/II
+ACC-07  1.2.3 = = 1.2.3!ms 1.2.3 1.2.3!ms 1.2.3 = - - -
+ACC-08  2.3.1.2!ms = 2.3.1.1 2.3.1.1!ms 2.3.1.1 2.3.1.1!ms 2.3.1.1 2.3.1.2 - WN19-SO-000010/II WN22-SO-000010/II
+ACC-09  2.3.10.1 = = = = = = = - WN19-SO-000210/I WN22-SO-000210/II
+ACC-10  2.3.7.3 = = = = = = 2.3.7.4 - WN19-SO-000120/II WN22-SO-000120/II
+ACC-11  18.10.82.1 = 18.10.83.1 18.10.83.2 = = = 18.10.81.2 - WN19-CC-000450/II WN22-CC-000450/II
+ACC-12  - - - - - - - - - - -
+ACC-13  18.3.3!ms = - 18.9.26.1!ms - 18.9.26.1!ms - 18.9.25.1 - - -
+ACC-14  2.3.7.9 = = = 2.3.7.7 2.3.7.9 2.3.7.7 2.3.7.9 - WN19-SO-000150/II WN22-SO-000150/II
+URA-01  2.2.4 = 2.2.3 2.2.4 2.2.3 2.2.4 2.2.3 = - WN19-UR-000020/I WN22-UR-000020/I
+URA-02  2.2.14 = 2.2.10 2.2.14 2.2.10 2.2.14 2.2.10 2.2.11 - WN19-UR-000060/I WN22-UR-000060/II
+URA-03  2.2.1 = = = = = = = - WN19-UR-000010/II WN22-UR-000010/II
+URA-04  2.2.19 = 2.2.14 2.2.19 2.2.14 2.2.19 2.2.14 2.2.15 - WN19-UR-000090/I WN22-UR-000100/I
+URA-05  2.2.34 = 2.2.25 2.2.34 2.2.25 2.2.34 2.2.25 2.2.26 - WN19-UR-000150/II WN22-UR-000150/II
+URA-06  2.2.48 = 2.2.36 2.2.48 2.2.36 2.2.48 2.2.36 2.2.39 - WN19-UR-000220/II WN22-UR-000220/II
+URA-07  2.2.38!ms = 2.2.27 2.2.37!dc,2.2.38!ms 2.2.27 2.2.37!dc,2.2.38!ms 2.2.27 2.2.30 - WN19-UR-000170/II!dc,WN19-UR-000170/II!ms WN22-UR-000170/II!dc,WN22-UR-000170/II!ms
+URA-08  2.2.10 = 2.2.7 2.2.11 2.2.7 2.2.11 2.2.7 = - WN19-UR-000040/II WN22-UR-000040/II
+URA-09  2.2.45 = 2.2.34 2.2.45 2.2.34 2.2.45 2.2.34 2.2.37 - WN19-UR-000210/II WN22-UR-000210/II
+URA-10  2.2.40 = 2.2.29 2.2.40 2.2.29 2.2.40 2.2.29 2.2.32 - WN19-UR-000180/II WN22-UR-000180/II
+URA-11  2.2.35 = 2.2.26 2.2.35 2.2.26 2.2.35 2.2.26 2.2.27 - WN19-UR-000160/II WN22-UR-000160/II
+URA-12  2.2.16 = 2.2.12 2.2.16 2.2.12 2.2.16 2.2.12 2.2.13 - WN19-UR-000080/II WN22-UR-000080/II
+URA-13  2.2.27!dc,2.2.28!ms = 2.2.20 2.2.27!dc,2.2.28!ms 2.2.20 2.2.27!dc,2.2.28!ms 2.2.20 2.2.21 - WN19-DC-000420/II!dc,WN19-MS-000130/II!ms WN22-DC-000420/II!dc,WN22-MS-000130/II!ms
+URA-14  2.2.20!dc,2.2.21!ms = 2.2.15 2.2.20!dc,2.2.21!ms 2.2.15 2.2.20!dc,2.2.21!ms 2.2.15 2.2.16 - WN19-DC-000370/II!dc,WN19-MS-000080/II!ms WN22-DC-000370/II!dc,WN22-MS-000080/II!ms
+URA-15  2.2.25!dc,2.2.26!ms = 2.2.19 2.2.25!dc,2.2.26!ms 2.2.19 2.2.25!dc,2.2.26!ms 2.2.19 2.2.20 - WN19-MS-000120/II!ms WN22-DC-000410/II!dc,WN22-MS-000120/II!ms
+URA-16  2.2.2!dc,2.2.3!ms = 2.2.2 2.2.2!dc,2.2.3!ms 2.2.2 2.2.2!dc,2.2.3!ms 2.2.2 = - WN19-DC-000340/II!dc,WN19-MS-000070/II!ms WN22-DC-000340/II!dc,WN22-MS-000070/II!ms
+URA-17  2.2.7 = 2.2.5 2.2.7!dc,2.2.8!ms 2.2.5 2.2.7!dc,2.2.8!ms 2.2.5 = - - WN22-UR-000030/II
+AUD-01  17.1.1 = = = = = = = - WN19-AU-000070/II WN22-AU-000070/II
+AUD-02  17.2.5 = 17.2.2 17.2.5 17.2.2 17.2.5 17.2.2 = - WN19-AU-000100/II WN22-AU-000100/II
+AUD-03  17.2.6 = 17.2.3 17.2.6 17.2.3 17.2.6 17.2.3 = - WN19-AU-000110/II WN22-AU-000110/II
+AUD-04  17.3.1 = = = = = = = - WN19-AU-000130/II WN22-AU-000130/II
+AUD-05  17.3.2 = = = = = = = - WN19-AU-000140/II WN22-AU-000140/II
+AUD-06  17.5.1 = = = = = = = - WN19-AU-000160/II WN22-AU-000160/II
+AUD-07  17.5.2 = = = = = = = - WN19-AU-000170/II WN22-AU-000170/II
+AUD-08  17.5.4 = = = = = = = - WN19-AU-000190/II WN22-AU-000190/II
+AUD-09  17.5.5 = = = = = = = - - -
+AUD-10  17.5.6 = = = = = = = - WN19-AU-000210/II WN22-AU-000210/II
+AUD-11  17.6.1 = = = = = = = - - -
+AUD-12  17.6.2 = = = = = = = - - -
+AUD-13  17.6.3 = = = = = = = - WN19-AU-000220/II WN22-AU-000220/II
+AUD-14  17.6.4 = = = = = = = - WN19-AU-000240/II WN22-AU-000240/II
+AUD-15  17.7.1 = = = = = = = - WN19-AU-000260/II WN22-AU-000260/II
+AUD-16  17.7.2 = = = = = = = - WN19-AU-000280/II WN22-AU-000280/II
+AUD-17  17.7.4 = = = = = = = - - -
+AUD-18  17.7.5 = = = = = = = - - -
+AUD-19  17.8.1 = = = = = = = - - WN22-AU-000300/II
+AUD-20  17.9.2 = = = = = = = - WN19-AU-000340/II WN22-AU-000340/II
+AUD-21  17.9.3 = = = = = = = - WN19-AU-000360/II WN22-AU-000360/II
+AUD-22  17.9.4 = = = = = = = - WN19-AU-000370/II WN22-AU-000370/II
+AUD-23  17.9.5 = = = = = = = - WN19-AU-000380/II WN22-AU-000380/II
+AUD-24  17.7.3 = = = = = = = - WN19-AU-000290/II WN22-AU-000290/II
+AUD-40  2.3.2.1 2.3.1.5 2.3.2.1 = = = = = - WN19-SO-000050/II WN22-SO-000050/II
+AUD-41  18.9.3.1 = = = = = = = - WN19-CC-000090/II WN22-CC-000090/II
+AUD-42  18.10.87.1 = 18.10.88.1/L2 = = = = 18.10.86.1/L2 - WN19-CC-000460/II WN22-CC-000460/II
+AUD-43  18.10.26.1.2,18.10.26.2.2,18.10.26.3.2,18.10.26.4.2 = = = = = = 18.10.25.1.2,18.10.25.2.2,18.10.25.3.2,18.10.25.4.2 - WN19-CC-000270/II,WN19-CC-000280/II,WN19-CC-000290/II WN22-CC-000270/II,WN22-CC-000280/II,WN22-CC-000290/II
+DEF-01  18.10.43.17 = - - - - - 18.10.42.17 - - -
+DEF-02  18.10.43.10.2 = - - - - - 18.10.42.10.2 1.10.5 - -
+DEF-03  18.10.43.10.3 = - - - - - 18.10.42.10.3 1.10.6 - -
+DEF-04  18.10.43.10.1 = - - - - - 18.10.42.10.1 1.10.4 - -
+DEF-05  18.10.43.10.4 = - - - - - 18.10.42.10.4 1.10.8 - -
+DEF-06  18.10.43.5.2/L2 = - - - - - 18.10.42.5.2/L2 1.5.3 - -
+DEF-07  - - - - - - - - 1.5.2 - -
+DEF-08  - - - - - - - - 1.5.4 - -
+DEF-09  - - - - - - - - 1.7.2 - -
+DEF-10  18.10.43.16 = - - - - - 18.10.42.16 1.16 - -
+DEF-11  18.10.43.13.1 = - - - - - 18.10.42.13.2 1.13.5 - -
+DEF-12  18.10.43.6.3.1 = - - - - - 18.10.42.6.3.1 1.6.3.1 - -
+DEF-21  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.5 - -
+DEF-22  - - - - - - - - 1.6.1.2 - -
+DEF-23  - - - - - - - - 1.6.1.17 - -
+DEF-24  - - - - - - - - 1.6.1.13 - -
+DEF-25  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.8 - -
+DEF-26  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.9 - -
+DEF-27  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.15 - -
+DEF-28  - - - - - - - - - - -
+DEF-29  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.6 - -
+DEF-30  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.4 - -
+DEF-31  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.10 - -
+DEF-32  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.11 - -
+DEF-33  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.16 - -
+DEF-34  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.12 - -
+DEF-35  18.10.43.6.1.2 = - - - - - 18.10.42.6.1.2 1.6.1.3 - -
+DEF-36  - - - - - - - - - - -
+FW-01   9.1.1,9.1.2 = = = - 9.1.1,9.1.2 - 9.1.1,9.1.2 - WNFWA-000001/II,WNFWA-000004/I =
+FW-02   9.2.1,9.2.2 = = = = = = = - WNFWA-000002/II,WNFWA-000012/I =
+FW-03   9.3.1,9.3.2 = = = = = = = - WNFWA-000003/II,WNFWA-000020/I =
+FW-04   9.1.7,9.1.8,9.2.7,9.2.8,9.3.9,9.3.10 = 9.1.6,9.1.7,9.2.6,9.2.7,9.3.8,9.3.9 = 9.2.6,9.2.7,9.3.6,9.3.7 9.1.6,9.1.7,9.2.6,9.2.7,9.3.8,9.3.9 9.2.6,9.2.7,9.3.6,9.3.7 9.1.6,9.1.7,9.2.6,9.2.7,9.3.8,9.3.9 - WNFWA-000010/III,WNFWA-000011/II,WNFWA-000018/III,WNFWA-000019/III,WNFWA-000028/III,WNFWA-000029/III =
+RDP-01  18.10.57.3.9.4 = = = = = = 18.10.56.3.9.4 - - -
+RDP-02  18.10.57.3.9.2,18.10.57.3.9.5 = = = = = = 18.10.56.3.9.2,18.10.56.3.9.5 - WN19-CC-000370/II,WN19-CC-000380/II WN22-CC-000370/II,WN22-CC-000380/II
+RDP-03  18.10.57.2.2 = = = = = = 18.10.56.2.3 - WN19-CC-000340/II WN22-CC-000340/II
+RDP-04  18.10.57.3.9.1 = = = = = = 18.10.56.3.9.1 - WN19-CC-000360/II WN22-CC-000360/II
+RDP-05  18.10.57.3.3.2 = = 18.10.57.3.3.3 = = = 18.10.56.3.3.3 - WN19-CC-000350/II WN22-CC-000350/II
+RDP-06  18.9.34.2 = 18.9.37.2 = = = = 18.9.35.2 - - -
+WRM-01  18.10.89.2.1,18.10.89.2.3 = 18.10.90.2.1,18.10.90.2.3 = = = = 18.10.88.2.1,18.10.88.2.3 - WN19-CC-000500/I,WN19-CC-000510/II WN22-CC-000500/I,WN22-CC-000510/II
+WRM-02  18.10.89.1.1,18.10.89.1.2,18.10.89.1.3 = 18.10.90.1.1,18.10.90.1.2,18.10.90.1.3 = = = = 18.10.88.1.1,18.10.88.1.2,18.10.88.1.3 - WN19-CC-000470/I,WN19-CC-000480/II,WN19-CC-000490/II WN22-CC-000470/I,WN22-CC-000480/II,WN22-CC-000490/II
+WRM-03  18.10.89.2.4 = 18.10.90.2.4 = = = = 18.10.88.2.4 - WN19-CC-000520/II WN22-CC-000520/II
+SYS-01  18.10.7.1,18.10.7.2,18.10.7.3 = 18.10.8.1,18.10.8.2,18.10.8.3 = = = = 18.10.7.1,18.10.7.2,18.10.7.3 - WN19-CC-000210/I,WN19-CC-000220/I,WN19-CC-000230/I WN22-CC-000210/I,WN22-CC-000220/I,WN22-CC-000230/I
+SYS-02  18.10.81.1,18.10.81.2 = 18.10.82.1,18.10.82.2 = = = = 18.10.80.1,18.10.80.2 - WN19-CC-000420/II,WN19-CC-000430/I WN22-CC-000420/II,WN22-CC-000430/I
+SYS-03  18.4.5 = = = 18.4.4 18.4.5 18.4.4 18.4.6 - - -
+SYS-04  18.9.13.1 = = = = = = = - WN19-CC-000130/II WN22-CC-000130/II
+SYS-05  2.3.15.2 = = = = = = = - WN19-SO-000370/III WN22-SO-000370/II
+SYS-06  - 18.9.24.1 = = = = = 18.9.24.1/BL - - -
+SYS-07  18.10.76.2.1 = 18.10.77.2.1 = = = = 18.10.75.2.1 - WN19-CC-000300/II WN22-CC-000300/II
+SYS-08  - - 18.10.29.2 = = = = - - - -
+SYS-09  - - - - - - - - - - -
+SYS-10  18.10.59.3 = = = = = = 18.10.58.5 - WN19-CC-000410/II WN22-CC-000410/II
+SYS-11  18.9.27.4!ms = 18.9.29.4 18.9.29.4!ms - 18.9.29.4!ms - 18.9.28.4 - WN19-MS-000030/II!ms WN22-MS-000030/II!ms
+SYS-12  18.7.8 = 18.7.9 = = 18.7.10 = 18.7.8 - - -
+SYS-13  18.4.2 = 18.7.8 = = = = 18.4.2 - - -
+SYS-14  18.9.19.2,18.9.19.3 = - - - - - 18.9.19.2,18.9.19.3 - WN19-CC-000140/II WN22-CC-000140/II
+SYS-15  5.1!dc = - 5.1!dc - 5.1!dc - - - - -
+SYS-16  5.2/L2!ms = - 5.2/L2!ms - 5.2/L2!ms - - - - -
+SYS-17  - - - - - - - - - - -
+SYS-18  - - - - - - - - - - -
+SYS-19  - - - - - - - - - - -
+TLS-01  - - - - - - - - - - -
+TLS-02  - - - - - - - - - - -
+TLS-03  - - - - - - - - - - -
+TLS-04  - - - - - - - - - - -
+AUD-25  17.1.2!dc = - 17.1.2!dc - 17.1.2!dc - - - - -
+AUD-26  17.1.3!dc = - 17.1.3!dc - 17.1.3!dc - - - - -
+AUD-27  17.2.2!dc = - 17.2.2!dc - 17.2.2!dc - - - WN19-DC-000230/II!dc WN22-DC-000230/II!dc
+AUD-28  17.2.4!dc = - 17.2.4!dc - 17.2.4!dc - - - WN19-AU-000090/II WN22-AU-000090/II
+AUD-29  17.4.1!dc = - 17.4.1!dc - 17.4.1!dc - - - WN19-DC-000240/II!dc WN22-DC-000240/II!dc
+AUD-30  17.4.2!dc = - 17.4.2!dc - 17.4.2!dc - - - - WN22-DC-000260/II!dc
+CIS-001 - - 1.1.2 = = = = - - WN19-AC-000050/II WN22-AC-000050/II
+CIS-002 - - 1.1.3 = = = = - - WN19-AC-000060/II WN22-AC-000060/II
+CIS-003 - - - 1.1.6!ms 1.1.6 1.1.6!ms 1.1.6 - - - -
+CIS-004 - - - 2.2.5!dc - 2.2.5!dc - - - WN19-DC-000350/II!dc WN22-DC-000350/II!dc
+CIS-005 - - 2.2.4 2.2.6 2.2.4 2.2.6 2.2.4 - - - -
+CIS-006 - - - 2.2.9!dc - 2.2.9!dc - - - WN19-DC-000360/II!dc WN22-DC-000360/II!dc
+CIS-007 - - 2.2.6 2.2.10!ms 2.2.6 2.2.10!ms 2.2.6 - - WN19-DC-000360/II!dc WN22-DC-000360/II!dc
+CIS-008 - - 2.2.8 2.2.12 2.2.8 2.2.12 2.2.8 - - - -
+CIS-009 - - 2.2.9 2.2.13 2.2.9 2.2.13 2.2.9 - - WN19-UR-000050/II WN22-UR-000050/II
+CIS-010 - - 2.2.11 2.2.15 2.2.11 2.2.15 2.2.11 - - WN19-UR-000070/II WN22-UR-000070/II
+CIS-011 - - - 2.2.17!dc - 2.2.17!dc - - - WN19-UR-000090/II!ms,WN19-UR-000090/II!dc WN22-UR-000090/II
+CIS-012 - - 2.2.13 2.2.18!ms 2.2.13 2.2.18!ms 2.2.13 - - WN19-UR-000090/II!ms,WN19-UR-000090/II!dc WN22-UR-000090/II
+CIS-013 - - 2.2.16 2.2.22 2.2.16 2.2.22 2.2.16 - - WN19-DC-000380/II!dc,WN19-MS-000090/II!ms WN22-DC-000380/II,WN22-MS-000090/II!ms
+CIS-014 - - 2.2.17 2.2.23 2.2.17 2.2.23 2.2.17 - - WN19-DC-000390/II!dc,WN19-MS-000100/II!ms WN22-DC-000390/II!dc,WN22-MS-000100/II!ms
+CIS-015 - - 2.2.18 2.2.24 2.2.18 2.2.24 2.2.18 - - WN19-DC-000400/II!dc,WN19-MS-000110/II!ms WN22-DC-000400/II!dc,WN22-MS-000110/II!ms
+CIS-016 - - 2.2.21 2.2.29 2.2.21 2.2.29 2.2.21 - - WN19-UR-000110/II WN22-UR-000110/II
+CIS-017 - - - - - 2.2.30 2.2.22 - - WN19-UR-000120/II WN22-UR-000120/II
+CIS-018 - - - - - 2.2.31!dc,2.2.32!ms 2.2.23 - - WN19-UR-000130/II!dc,WN19-UR-000130/II!ms WN22-UR-000130/II!dc,WN22-UR-000130/II!ms
+CIS-019 - - 2.2.24 2.2.33 2.2.24 2.2.33 2.2.24 - - WN19-UR-000140/II WN22-UR-000140/II
+CIS-020 - - 2.2.28 2.2.39 2.2.28 2.2.39 2.2.28 - - - -
+CIS-021 - - 2.2.30 2.2.41 2.2.30 2.2.41 2.2.30 - - WN19-UR-000190/II WN22-UR-000190/II
+CIS-022 - - 2.2.31 2.2.42 2.2.31 2.2.42 2.2.31 - - WN19-UR-000200/II WN22-UR-000200/II
+CIS-023 - - 2.2.32 2.2.43 2.2.32 2.2.43 2.2.32 - - - -
+CIS-024 - - 2.2.33 2.2.44 2.2.33 2.2.44 2.2.33 - - - -
+CIS-025 - - 2.2.35 2.2.46 2.2.35 2.2.46 2.2.35 - - - -
+CIS-026 - - - 2.2.47!dc - 2.2.47!dc - - - - -
+CIS-027 - - 2.3.1.3 = = = = - - WN19-SO-000030/II WN22-SO-000030/II
+CIS-028 - - 2.3.1.4 = = = = - - WN19-SO-000040/II WN22-SO-000040/II
+CIS-029 - - 2.3.2.2 = = = = - - - -
+CIS-030 - - 2.3.4.1 = = = = - - - -
+CIS-031 - - - 2.3.5.1!dc - 2.3.5.1!dc - - - - -
+CIS-032 - - - 2.3.5.2!dc - 2.3.5.2!dc - - - - -
+CIS-033 - - - 2.3.5.3!dc - 2.3.5.3!dc - - - - -
+CIS-034 - - - - - 2.3.5.4!dc - - - - -
+CIS-035 - - - 2.3.5.5!dc - 2.3.5.5!dc - - - WN19-DC-000330/II!dc WN22-DC-000330/II!dc
+CIS-036 - - 2.3.6.1 = - 2.3.6.1 - - - WN19-SO-000060/II WN22-SO-000060/II
+CIS-037 - - 2.3.6.2 = - 2.3.6.2 - - - WN19-SO-000070/II WN22-SO-000070/II
+CIS-038 - - 2.3.6.3 = - 2.3.6.3 - - - WN19-SO-000080/II WN22-SO-000080/II
+CIS-039 - - 2.3.6.4 = - 2.3.6.4 - - - WN19-SO-000090/II WN22-SO-000090/II
+CIS-040 - - 2.3.6.5 = - 2.3.6.5 - - - WN19-SO-000100/II WN22-SO-000100/II
+CIS-041 - - 2.3.6.6 = - 2.3.6.6 - - - WN19-SO-000110/II WN22-SO-000110/II
+CIS-042 - - 2.3.7.2 = = = = - - - -
+CIS-043 - - 2.3.7.4 = = = = - - WN19-SO-000130/II WN22-SO-000130/II
+CIS-044 - - 2.3.7.5 = = = = - - WN19-SO-000140/III WN22-SO-000140/II
+CIS-045 - - 2.3.7.7 = 2.3.7.6 2.3.7.7 2.3.7.6 - - - -
+CIS-046 - - 2.3.7.8 2.3.7.8!ms - 2.3.7.8!ms - - - - -
+CIS-047 - - 2.3.9.1 = = = = - - - -
+CIS-048 - - 2.3.9.3 = = = = - - - -
+CIS-049 - - 2.3.9.4 2.3.9.4!ms 2.3.9.4 2.3.9.4!ms 2.3.9.4 - - - -
+CIS-050 - - 2.3.10.5 = = = = - - WN19-SO-000240/II WN22-SO-000240/II
+CIS-051 - - - 2.3.10.6!dc - 2.3.10.6!dc - - - - -
+CIS-052 - - 2.3.10.6 2.3.10.7!ms 2.3.10.6 2.3.10.7!ms 2.3.10.6 - - - -
+CIS-053 - - 2.3.10.7 2.3.10.8 2.3.10.7 2.3.10.8 2.3.10.7 - - - -
+CIS-054 - - 2.3.10.8 2.3.10.9 2.3.10.8 2.3.10.9 2.3.10.8 - - - -
+CIS-055 - - 2.3.10.11 2.3.10.12 2.3.10.11 2.3.10.12 2.3.10.11 - - - -
+CIS-056 - - 2.3.10.12 2.3.10.13 2.3.10.12 2.3.10.13 2.3.10.12 - - - -
+CIS-057 - - 2.3.11.1 = = = = - - WN19-SO-000260/II WN22-SO-000260/II
+CIS-058 - - 2.3.11.3 = = = = - - WN19-SO-000280/II WN22-SO-000280/II
+CIS-059 - - 2.3.11.4 = = = = - - WN19-SO-000290/II WN22-SO-000290/II
+CIS-060 - - - - - 2.3.11.7 = - - - -
+CIS-061 - - - 2.3.11.12!dc - 2.3.11.12!dc - - - - -
+CIS-062 - - 2.3.13.1 = = = = - - - -
+CIS-063 - - 2.3.15.1 = = = = - - - -
+CIS-064 - - 2.3.17.7 = = = = - - - -
+CIS-065 - - 9.1.3 = - 9.1.3 - - - - -
+CIS-066 - - 9.1.4 = - 9.1.4 - - - - -
+CIS-067 - - 9.1.5 = - 9.1.5 - - - WNFWA-000009/III =
+CIS-068 - - 9.2.3 = = = = - - - -
+CIS-069 - - 9.2.4 = = = = - - - -
+CIS-070 - - 9.2.5 = = = = - - WNFWA-000017/III =
+CIS-071 - - 9.3.3 = = = = - - - -
+CIS-072 - - 9.3.4 = - 9.3.4 - - - WNFWA-000024/II =
+CIS-073 - - 9.3.5 = - 9.3.5 - - - WNFWA-000025/II =
+CIS-074 - - 9.3.6 = 9.3.4 9.3.6 9.3.4 - - - -
+CIS-075 - - 9.3.7 = 9.3.5 9.3.7 9.3.5 - - WNFWA-000027/III =
+CIS-076 - - 17.2.1 = = = = - - - -
+CIS-077 - - - 17.2.3!dc - 17.2.3!dc - - - - -
+CIS-078 - - 17.5.3 = = = = - - WN19-AU-000180/II WN22-AU-000180/II
+CIS-079 - - 17.9.1 = = = = - - WN19-AU-000320/II WN22-AU-000320/II
+CIS-080 - - 18.1.1.1 = = = = - - - WN22-CC-000010/II
+CIS-081 - - 18.1.1.2 = = = = - - WN19-CC-000010/II -
+CIS-082 - - 18.1.2.2 = = = = - - - -
+CIS-083 - - 18.4.4 = 18.4.3 18.4.4 18.4.3 - - - -
+CIS-084 - - 18.5.1 = = = = - - - -
+CIS-085 - - 18.5.8 = = = = - - - -
+CIS-086 - - 18.5.11 = = = = - - - -
+CIS-087 - - 18.6.4.1 = = = = - - - -
+CIS-088 - - - 18.6.8.2 = 18.6.8.7 = - - - -
+CIS-089 - - 18.6.11.2 = = = = - - - -
+CIS-090 - - 18.6.11.3 = = = = - - - -
+CIS-091 - - 18.6.11.4 = - 18.6.11.4 - - - - -
+CIS-092 - - 18.6.21.1 = = = = - - - -
+CIS-093 - - 18.7.1 = = = = - - - -
+CIS-094 - - 18.7.2 = = = = - - - -
+CIS-095 - - 18.7.3 = = = = - - - -
+CIS-096 - - 18.7.4 = = = = - - - -
+CIS-097 - - 18.7.5 = = = = - - - -
+CIS-098 - - 18.7.6 = = = = - - - -
+CIS-099 - - 18.7.7 = = = = - - - -
+CIS-100 - - 18.7.10 = = 18.7.11 = - - - -
+CIS-101 - - 18.7.11 = = 18.7.12 = - - - -
+CIS-102 - - 18.7.12 = = 18.7.13 = - - - -
+CIS-103 - - 18.9.7.2 = = = = - - - -
+CIS-104 - - 18.9.17.1 = = = = - - - -
+CIS-105 - - 18.9.19.2 = - 18.9.19.2 - - - - -
+CIS-106 - - 18.9.19.3 = - 18.9.19.3 - - - - -
+CIS-107 - - 18.9.19.4 = 18.9.19.2 18.9.19.4 18.9.19.2 - - - -
+CIS-108 - - 18.9.19.5 = - 18.9.19.5 - - - - -
+CIS-109 - - 18.9.20.1.1 = = = = - - WN19-CC-000150/II WN22-CC-000150/II
+CIS-110 - - 18.9.20.1.5 = = = = - - - -
+CIS-111 - - - 18.9.26.2!ms - 18.9.26.2!ms - - - - -
+CIS-112 - - - 18.9.26.3!ms - 18.9.26.3!ms - - - - -
+CIS-113 - - - - - 18.9.26.4!ms - - - - -
+CIS-114 - - - 18.9.26.5!ms - 18.9.26.5!ms - - - - -
+CIS-115 - - - 18.9.26.6!ms - 18.9.26.6!ms - - - - WN22-00-000020/II
+CIS-116 - - - 18.9.26.7!ms - 18.9.26.7!ms - - - - -
+CIS-117 - - - 18.9.26.8!ms - 18.9.26.8!ms - - - - -
+CIS-118 - - - 18.9.27.1!dc - 18.9.27.1!dc - - - - -
+CIS-119 - - 18.9.29.1 = = = = - - - -
+CIS-120 - - 18.9.29.2 = = = = - - WN19-CC-000170/II WN22-CC-000170/II
+CIS-121 - - 18.9.29.3 = - 18.9.29.3 - - - - -
+CIS-122 - - 18.9.29.5 = 18.9.29.3 18.9.29.5 18.9.29.3 - - - -
+CIS-123 - - 18.9.29.6 = 18.9.29.4 18.9.29.6 18.9.29.4 - - - -
+CIS-124 - - - - - 18.9.31.1.1 - - - - -
+CIS-125 - - 18.9.35.6.3 = = = = - - WN19-CC-000180/II WN22-CC-000180/II
+CIS-126 - - 18.9.35.6.4 = = = = - - WN19-CC-000190/II WN22-CC-000190/II
+CIS-127 - - 18.9.37.1 = = = = - - - -
+CIS-128 - - 18.9.38.1 18.9.38.1!ms 18.9.38.1 18.9.38.1!ms 18.9.38.1 - - - -
+CIS-129 - - - - - 18.9.41.1!dc - - - - -
+CIS-130 - - - - - 18.9.41.2!ms 18.9.41.1 - - - -
+CIS-131 - - - 18.9.41.1!dc - 18.9.41.3!dc - - - - -
+CIS-132 - - 18.9.53.1.1 = = = = - - - -
+CIS-133 - - 18.9.53.1.2 18.9.53.1.2!ms - 18.9.53.1.2!ms - - - - -
+CIS-134 - - - - - 18.10.4.2 = - - - -
+CIS-135 - - 18.10.6.1 = = = = - - - -
+CIS-136 - - 18.10.9.1.1 = = = = - - - -
+CIS-137 - - 18.10.13.1 = = = = - - - -
+CIS-138 - - 18.10.14.1 = = = = - - - -
+CIS-139 - - 18.10.15.1 = = = = - - - -
+CIS-140 - - 18.10.15.2 = = = = - - WN19-CC-000240/II WN22-CC-000240/II
+CIS-141 - - 18.10.16.1 = = = = - - WN19-CC-000250/II WN22-CC-000250/II
+CIS-142 - - 18.10.16.3 = = = = - - - -
+CIS-143 - - 18.10.18.2 = = = = - - - -
+CIS-144 - - 18.10.18.3 = = = = - - - -
+CIS-145 - - 18.10.18.4 = = = = - - - -
+CIS-146 - - 18.10.18.5 = 18.10.18.6 18.10.18.5 = - - - -
+CIS-147 - - 18.10.18.6 = 18.10.18.5 18.10.18.6 = - - - -
+CIS-148 - - 18.10.26.1.1 = = = = - - - -
+CIS-149 - - 18.10.26.2.1 = = = = - - - -
+CIS-150 - - 18.10.26.3.1 = = = = - - - -
+CIS-151 - - 18.10.26.4.1 = = = = - - - -
+CIS-152 - - 18.10.29.3 = = = = - - WN19-CC-000310/II WN22-CC-000310/II
+CIS-153 - - 18.10.29.4 = = = = - - WN19-CC-000320/III WN22-CC-000320/III
+CIS-154 - - 18.10.29.5 = = = = - - WN19-CC-000330/II WN22-CC-000330/II
+CIS-155 - - 18.10.41.1 = = = = - - - -
+CIS-156 - - 18.10.57.3.9.3 = = = = - - - -
+CIS-157 - - 18.10.57.3.10.1 = = = = - - - -
+CIS-158 - - 18.10.57.3.11.1 = = = = - - - -
+CIS-159 - - 18.10.57.3.11.2 = = = = - - - -
+CIS-160 - - 18.10.58.1 = = = = - - WN19-CC-000390/II WN22-CC-000390/II
+CIS-161 - - 18.10.81.2 = = = = - - - -
+CIS-162 - - - 18.10.83.1 = = = - - - -
+CIS-163 - - 18.10.93.2.1 = = = = - - - -
+CIS-164 - - 18.10.94.1.1 = = = = - - - -
+CIS-165 - - 18.10.94.2.1 = = = = - - - -
+CIS-166 - - 18.10.94.2.2 = = = = - - - -
+CIS-167 - - 18.10.94.4.1 = = = = - - - -
+CIS-168 - - 18.10.94.4.2 = = = = - - - -
+CIS-169 - - 18.11.1 = = = = - - - -
+CIS-170 - - - 18.11.2 = = = - - - -
+CIS-171 - - 2.2.22 2.2.30 2.2.22 - - - - WN19-UR-000120/II WN22-UR-000120/II
+CIS-172 - - 2.2.23 2.2.31!dc,2.2.32!ms 2.2.23 - - - - WN19-UR-000130/II!dc,WN19-UR-000130/II!ms WN22-UR-000130/II!dc,WN22-UR-000130/II!ms
+CIS-173 - - - 2.3.5.4!dc - - - - - WN19-DC-000320/II!dc WN22-DC-000320/II!dc
+CIS-174 - - - 18.9.26.4!ms - - - - - - -
+CIS-175 - - 18.10.58.2 = = - - - - WN19-CC-000400/II WN22-CC-000400/II
+CIS-176 - - - - - - - - 1.4.1 - -
+CIS-177 - - - - - - - - 1.5.1 - -
+CIS-178 - - - - - - - - 1.6.1.1 - -
+CIS-179 - - - - - - - - 1.6.1.7 - -
+CIS-180 - - - - - - - - 1.6.1.14 - -
+CIS-181 - - - - - - - - 1.7.1 - -
+CIS-182 - - - - - - - - 1.10.1 - -
+CIS-183 - - - - - - - - 1.10.2 - -
+CIS-184 - - - - - - - - 1.10.3 - -
+CIS-185 - - - - - - - - 1.10.7 - -
+CIS-186 - - - - - - - - 1.11.1.1.2 - -
+CIS-187 - - - - - - - - 1.11.1.2.2 - -
+CIS-188 - - - - - - - - 1.12.2 - -
+CIS-189 - - - - - - - - 1.13.1 - -
+CIS-190 - - - - - - - - 1.13.2 - -
+CIS-191 - - - - - - - - 1.13.3 - -
+CIS-192 - - - - - - - - 1.13.4 - -
+CIS-193 - - - - - - - - 1.13.6 - -
+CIS-194 - - - - - - - - 1.13.7 - -
+CIS-195 - - - - - - - - 1.13.8 - -
+CIS-196 - - - - - - - - 1.13.9 - -
+CIS-197 - - - - - - - - 1.13.10 - -
+CIS-198 - - - - - - - - 1.13.11 - -
+CIS-199 - - - - - - - - 1.14.1 - -
+CIS-200 - - - - - - - - 1.15.1 - -
+CIS-201 - - - - - - - - 1.15.2 - -
+CIS-202 - - - - - - - - 1.15.3 - -
+CIS-203 - - - - - - - - 1.15.4 - -
+CIS-204 - - - - - - - - 1.17 - -
+CIS-205 - - - - - - - - 1.18 - -
 '@
 
-# the CIS benchmark for this Windows version, or $null (Windows 10, Server 2012 R2 and older)
+# where CIS asks for another value than the check, which wants Microsoft's
+$CisNotes = @{
+    'ACC-05' = 'CIS allows up to 5 attempts; this check wants 3 or fewer, the Microsoft value.'
+    'ACC-14' = 'CIS also accepts 2 (force logoff) and 3 (disconnect the Remote Desktop session); this check wants 1 (lock the workstation), the Microsoft value.'
+    'LSA-09' = 'CIS wants 1 (LSA protection with UEFI lock); this check also accepts 2 (without the UEFI lock), as Microsoft does.'
+    'SMB-08' = 'CIS wants SMB 3.1.1 (785) as the lowest version; this check accepts SMB 3.0 (768), as Microsoft does. 785 also blocks Windows 8.1, Server 2012 R2 and older.'
+    'SYS-04' = 'CIS wants 3 (good, unknown, and bad but critical); this check also accepts 1 (good only) and 8 (good and unknown).'
+    'UAC-02' = 'CIS also accepts 1 (ask for credentials); this check wants 2 (ask for consent), the Microsoft value.'
+}
+
+# the CIS benchmark for this Windows version, or $null (Windows 10, Server 2012 R2 and older);
+# servers outside a domain get the Stand-alone benchmark where there is one
 function Get-CisBenchmark($H) {
     if ($H.server) {
-        if ($H.build -ge 26100) { return 'ws2025' }
-        if ($H.build -ge 20348) { return 'ws2022' }
-        if ($H.build -ge 17763) { return 'ws2019' }
-        if ($H.build -ge 14393) { return 'ws2016' }
-        return $null
+        $b = if ($H.build -ge 26100) { 'ws2025' } elseif ($H.build -ge 20348) { 'ws2022' }
+             elseif ($H.build -ge 17763) { 'ws2019' } elseif ($H.build -ge 14393) { 'ws2016' } else { $null }
+        if ($b -and -not $H.domain -and $CisBenchmarks.Contains("${b}sa")) { return "${b}sa" }
+        return $b
     }
     if ($H.build -ge 22000) { return 'win11' }
     $null
 }
 
-# CIS recommendations for one check, like '2.3.11.7 (L1)'
+# the DISA STIG for this Windows version (Server 2019 and 2022), or $null
+function Get-StigBenchmark($H) {
+    if (-not $H.server -or $H.build -ge 26100) { return $null }
+    if ($H.build -ge 20348) { return 'stig2022' }
+    if ($H.build -ge 17763) { return 'stig2019' }
+    $null
+}
+
+# CIS Benchmark Level 1 recommendations that no check above covers, read from the same PDFs.
+# Each runs only where the machine's benchmark lists it (see $CisTable), and is applied only
+# with -Apply cis. A setting that is not configured counts as failed, as in a CIS audit.
+#   id | kind | area | severity (from the DISA STIG category, else Low) | fix | title
+#     reg:   path | value name | op | want | type | value to set
+#     sec:   section | key | label | op | want | value to set
+#     audit: subcategory | GUID | 1 success, 2 failure, 3 both
+# want: a number, a..b (range), a,b (in), s:text, m:item;item (list)
+$CisChecks = @'
+CIS-001 | sec | CIS accounts | Medium | cis | Maximum password age = 365 or fewer days, but not 0
+    System Access | MaximumPasswordAge | Maximum password age | range | 1..365 | 365
+CIS-002 | sec | CIS accounts | Medium | cis | Minimum password age = 1 or more day(s)
+    System Access | MinimumPasswordAge | Minimum password age | ge | 1
+CIS-003 | reg | CIS accounts | Low | cis | Relax minimum password length limits = Enabled
+    HKLM:\System\CurrentControlSet\Control\SAM | RelaxMinimumPasswordLengthLimits | eq | 1 | DWord
+CIS-004 | sec | CIS user rights | Medium | cis | Add workstations to domain = Administrators
+    Privilege Rights | SeMachineAccountPrivilege | Add workstations to domain | only | m:*S-1-5-32-544
+CIS-005 | sec | CIS user rights | Low | cis | Adjust memory quotas for a process = Administrators, LOCAL SERVICE, NETWORK SERVICE
+    Privilege Rights | SeIncreaseQuotaPrivilege | Adjust memory quotas for a process | only | m:*S-1-5-32-544;*S-1-5-19;*S-1-5-20
+CIS-006 | sec | CIS user rights | Medium | manual | Allow log on through Remote Desktop Services = Administrators
+    Privilege Rights | SeRemoteInteractiveLogonRight | Allow log on through Remote Desktop Services | only | m:*S-1-5-32-544
+    how | Removes Remote Desktop access for everyone else. Check who logs on over Remote Desktop, then set it by hand or in a GPO.
+CIS-007 | sec | CIS user rights | Medium | manual | Allow log on through Remote Desktop Services = Administrators, Remote Desktop Users
+    Privilege Rights | SeRemoteInteractiveLogonRight | Allow log on through Remote Desktop Services | only | m:*S-1-5-32-544;*S-1-5-32-555
+    how | Removes Remote Desktop access for everyone else. Check who logs on over Remote Desktop, then set it by hand or in a GPO.
+CIS-008 | sec | CIS user rights | Low | cis | Change the system time = Administrators, LOCAL SERVICE
+    Privilege Rights | SeSystemtimePrivilege | Change the system time | only | m:*S-1-5-32-544;*S-1-5-19
+CIS-009 | sec | CIS user rights | Medium | cis | Create a pagefile = Administrators
+    Privilege Rights | SeCreatePagefilePrivilege | Create a pagefile | only | m:*S-1-5-32-544
+CIS-010 | sec | CIS user rights | Medium | cis | Create global objects = Administrators, LOCAL SERVICE, NETWORK SERVICE, SERVICE
+    Privilege Rights | SeCreateGlobalPrivilege | Create global objects | only | m:*S-1-5-32-544;*S-1-5-19;*S-1-5-20;*S-1-5-6
+CIS-011 | sec | CIS user rights | Medium | cis | Create symbolic links = Administrators
+    Privilege Rights | SeCreateSymbolicLinkPrivilege | Create symbolic links | only | m:*S-1-5-32-544
+CIS-012 | sec | CIS user rights | Medium | cis | Create symbolic links = Administrators, NT VIRTUAL MACHINE\Virtual Machines
+    Privilege Rights | SeCreateSymbolicLinkPrivilege | Create symbolic links | only | m:*S-1-5-32-544;*S-1-5-83-0
+CIS-013 | sec | CIS user rights | Medium | cis | Deny log on as a batch job includes Guests
+    Privilege Rights | SeDenyBatchLogonRight | Deny log on as a batch job | has | m:*S-1-5-32-546
+CIS-014 | sec | CIS user rights | Medium | cis | Deny log on as a service includes Guests
+    Privilege Rights | SeDenyServiceLogonRight | Deny log on as a service | has | m:*S-1-5-32-546
+CIS-015 | sec | CIS user rights | Medium | cis | Deny log on locally includes Guests
+    Privilege Rights | SeDenyInteractiveLogonRight | Deny log on locally | has | m:*S-1-5-32-546
+CIS-016 | sec | CIS user rights | Medium | cis | Force shutdown from a remote system = Administrators
+    Privilege Rights | SeRemoteShutdownPrivilege | Force shutdown from a remote system | only | m:*S-1-5-32-544
+CIS-017 | sec | CIS user rights | Medium | cis | Generate security audits = LOCAL SERVICE, NETWORK SERVICE, RESTRICTED SERVICES\PrintSpoolerService
+    Privilege Rights | SeAuditPrivilege | Generate security audits | only | m:*S-1-5-19;*S-1-5-20;*S-1-5-99-216390572-1995538116-3857911515-2404958512-2623887229
+CIS-018 | sec | CIS user rights | Medium | cis | Impersonate a client after authentication = Administrators, LOCAL SERVICE, NETWORK SERVICE, SERVICE, RESTRICTED SERVICES\PrintSpoolerService
+    Privilege Rights | SeImpersonatePrivilege | Impersonate a client after authentication | only | m:*S-1-5-32-544;*S-1-5-19;*S-1-5-20;*S-1-5-6;*S-1-5-99-216390572-1995538116-3857911515-2404958512-2623887229
+CIS-019 | sec | CIS user rights | Medium | cis | Increase scheduling priority = Administrators, Window Manager\Window Manager Group
+    Privilege Rights | SeIncreaseBasePriorityPrivilege | Increase scheduling priority | only | m:*S-1-5-32-544;*S-1-5-90-0
+CIS-020 | sec | CIS user rights | Low | cis | Modify an object label = No One
+    Privilege Rights | SeRelabelPrivilege | Modify an object label | only | m:
+CIS-021 | sec | CIS user rights | Medium | cis | Perform volume maintenance tasks = Administrators
+    Privilege Rights | SeManageVolumePrivilege | Perform volume maintenance tasks | only | m:*S-1-5-32-544
+CIS-022 | sec | CIS user rights | Medium | cis | Profile single process = Administrators
+    Privilege Rights | SeProfileSingleProcessPrivilege | Profile single process | only | m:*S-1-5-32-544
+CIS-023 | sec | CIS user rights | Low | cis | Profile system performance = Administrators, NT SERVICE\WdiServiceHost
+    Privilege Rights | SeSystemProfilePrivilege | Profile system performance | only | m:*S-1-5-32-544;*S-1-5-80-3139157870-2983391045-3678747466-658725712-1809340420
+CIS-024 | sec | CIS user rights | Low | cis | Replace a process level token = LOCAL SERVICE, NETWORK SERVICE
+    Privilege Rights | SeAssignPrimaryTokenPrivilege | Replace a process level token | only | m:*S-1-5-19;*S-1-5-20
+CIS-025 | sec | CIS user rights | Low | cis | Shut down the system = Administrators
+    Privilege Rights | SeShutdownPrivilege | Shut down the system | only | m:*S-1-5-32-544
+CIS-026 | sec | CIS user rights | Low | cis | Synchronize directory service data = No One
+    Privilege Rights | SeSyncAgentPrivilege | Synchronize directory service data | only | m:
+CIS-027 | sec | CIS security options | Medium | manual | Configure Accounts: Rename administrator account
+    System Access | NewAdministratorName | Accounts: Rename administrator account | ne | s:Administrator
+    how | Rename the built-in Administrator account (Local Security Policy > Security Options > Accounts: Rename administrator account, or a GPO).
+CIS-028 | sec | CIS security options | Medium | manual | Configure Accounts: Rename guest account
+    System Access | NewGuestName | Accounts: Rename guest account | ne | s:Guest
+    how | Rename the built-in Guest account (Local Security Policy > Security Options > Accounts: Rename guest account, or a GPO).
+CIS-029 | reg | CIS security options | Low | cis | Audit: Shut down system immediately if unable to log security audits = Disabled
+    HKLM:\System\CurrentControlSet\Control\Lsa | CrashOnAuditFail | eq | 0 | DWord
+CIS-030 | reg | CIS security options | Low | cis | Devices: Prevent users from installing printer drivers = Enabled
+    HKLM:\System\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers | AddPrinterDrivers | eq | 1 | DWord
+CIS-031 | reg | CIS security options | Low | cis | Domain controller: Allow server operators to schedule tasks = Disabled
+    HKLM:\System\CurrentControlSet\Control\Lsa | SubmitControl | eq | 0 | DWord
+CIS-032 | reg | CIS security options | Low | cis | Domain controller: Allow vulnerable Netlogon secure channel connections = Not Configured
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | VulnerableChannelAllowList | absent |  | String
+CIS-033 | reg | CIS security options | Low | cis | Domain controller: LDAP server channel binding token requirements = Always
+    HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters | LdapEnforceChannelBinding | eq | 2 | DWord
+CIS-034 | reg | CIS security options | Low | cis | Domain controller: LDAP server signing requirements Enforcement = Enabled
+    HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters | LDAPServerEnforceIntegrity | eq | 1 | DWord
+CIS-035 | reg | CIS security options | Medium | cis | Domain controller: Refuse machine account password changes = Disabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | RefusePasswordChange | eq | 0 | DWord
+CIS-036 | reg | CIS security options | Medium | cis | Domain member: Digitally encrypt or sign secure channel data (always) = Enabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | RequireSignOrSeal | eq | 1 | DWord
+CIS-037 | reg | CIS security options | Medium | cis | Domain member: Digitally encrypt secure channel data (when possible) = Enabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | SealSecureChannel | eq | 1 | DWord
+CIS-038 | reg | CIS security options | Medium | cis | Domain member: Digitally sign secure channel data (when possible) = Enabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | SignSecureChannel | eq | 1 | DWord
+CIS-039 | reg | CIS security options | Medium | cis | Domain member: Disable machine account password changes = Disabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | DisablePasswordChange | eq | 0 | DWord
+CIS-040 | reg | CIS security options | Medium | cis | Domain member: Maximum machine account password age = 30 or fewer days, but not 0
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | MaximumPasswordAge | range | 1..30 | DWord | 30
+CIS-041 | reg | CIS security options | Medium | cis | Domain member: Require strong (Windows 2000 or later) session key = Enabled
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | RequireStrongKey | eq | 1 | DWord
+CIS-042 | reg | CIS security options | Low | cis | Interactive logon: Don't display last signed-in = Enabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | DontDisplayLastUserName | eq | 1 | DWord
+CIS-043 | reg | CIS security options | Medium | manual | Configure Interactive logon: Message text for users attempting to log on
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | LegalNoticeText | set |  | String
+    how | Set the logon message text your organisation uses (Security Options > Interactive logon: Message text for users attempting to log on).
+CIS-044 | reg | CIS security options | Medium | manual | Configure Interactive logon: Message title for users attempting to log on
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | LegalNoticeCaption | set |  | String
+    how | Set the logon message title your organisation uses (Security Options > Interactive logon: Message title for users attempting to log on).
+CIS-045 | reg | CIS security options | Low | cis | Interactive logon: Prompt user to change password before expiration = between 5 and 14 days
+    HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon | PasswordExpiryWarning | range | 5..14 | DWord | 14
+CIS-046 | reg | CIS security options | Low | cis | Interactive logon: Require Domain Controller Authentication to unlock workstation = Enabled
+    HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon | ForceUnlockLogon | eq | 1 | DWord
+CIS-047 | reg | CIS security options | Low | cis | Microsoft network server: Amount of idle time required before suspending session = 15 or fewer minute(s)
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | AutoDisconnect | le | 15 | DWord | 15
+CIS-048 | reg | CIS security options | Low | cis | Microsoft network server: Disconnect clients when logon hours expire = Enabled
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | enableforcedlogoff | eq | 1 | DWord
+CIS-049 | reg | CIS security options | Low | cis | Microsoft network server: Server SPN target name validation level = Accept if provided by client or higher
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | SMBServerNameHardeningLevel | in | 1,2 | DWord | 1
+CIS-050 | reg | CIS security options | Medium | cis | Network access: Let Everyone permissions apply to anonymous users = Disabled
+    HKLM:\System\CurrentControlSet\Control\Lsa | EveryoneIncludesAnonymous | eq | 0 | DWord
+CIS-051 | reg | CIS security options | Low | cis | Configure Network access: Named Pipes that can be accessed anonymously (NullSessionPipes) on domain controllers
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | NullSessionPipes | subset | m:LSARPC;NETLOGON;SAMR | MultiString | m:LSARPC;NETLOGON;SAMR
+CIS-052 | reg | CIS security options | Low | cis | Configure Network access: Named Pipes that can be accessed anonymously (NullSessionPipes) on other servers
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | NullSessionPipes | subset | m:BROWSER | MultiString | m:
+CIS-053 | reg | CIS security options | Low | cis | Configure Network access: Remotely accessible registry paths
+    HKLM:\System\CurrentControlSet\Control\SecurePipeServers\Winreg\AllowedExactPaths | Machine | subset | m:System\CurrentControlSet\Control\ProductOptions;System\CurrentControlSet\Control\Server Applications;Software\Microsoft\Windows NT\CurrentVersion | MultiString | m:System\CurrentControlSet\Control\ProductOptions;System\CurrentControlSet\Control\Server Applications;Software\Microsoft\Windows NT\CurrentVersion
+CIS-054 | reg | CIS security options | Low | cis | Configure Network access: Remotely accessible registry paths and sub-paths
+    HKLM:\System\CurrentControlSet\Control\SecurePipeServers\Winreg\AllowedPaths | Machine | subset | m:System\CurrentControlSet\Control\Print\Printers;System\CurrentControlSet\Services\Eventlog;Software\Microsoft\OLAP Server;Software\Microsoft\Windows NT\CurrentVersion\Print;Software\Microsoft\Windows NT\CurrentVersion\Windows;System\CurrentControlSet\Control\ContentIndex;System\CurrentControlSet\Control\Terminal Server;System\CurrentControlSet\Control\Terminal Server\UserConfig;System\CurrentControlSet\Control\Terminal Server\DefaultUserConfiguration;Software\Microsoft\Windows NT\CurrentVersion\Perflib;System\CurrentControlSet\Services\SysmonLog;System\CurrentControlSet\Services\CertSvc;System\CurrentControlSet\Services\WINS | MultiString | m:System\CurrentControlSet\Control\Print\Printers;System\CurrentControlSet\Services\Eventlog;Software\Microsoft\OLAP Server;Software\Microsoft\Windows NT\CurrentVersion\Print;Software\Microsoft\Windows NT\CurrentVersion\Windows;System\CurrentControlSet\Control\ContentIndex;System\CurrentControlSet\Control\Terminal Server;System\CurrentControlSet\Control\Terminal Server\UserConfig;System\CurrentControlSet\Control\Terminal Server\DefaultUserConfiguration;Software\Microsoft\Windows NT\CurrentVersion\Perflib;System\CurrentControlSet\Services\SysmonLog;System\CurrentControlSet\Services\CertSvc;System\CurrentControlSet\Services\WINS
+CIS-055 | reg | CIS security options | Low | cis | Network access: Shares that can be accessed anonymously = None
+    HKLM:\System\CurrentControlSet\Services\LanManServer\Parameters | NullSessionShares | subset | m: | MultiString | m:
+CIS-056 | reg | CIS security options | Low | cis | Network access: Sharing and security model for local accounts = Classic - local users authenticate as themselves
+    HKLM:\System\CurrentControlSet\Control\Lsa | ForceGuest | eq | 0 | DWord
+CIS-057 | reg | CIS security options | Medium | cis | Network security: Allow Local System to use computer identity for NTLM = Enabled
+    HKLM:\System\CurrentControlSet\Control\Lsa | UseMachineId | eq | 1 | DWord
+CIS-058 | reg | CIS security options | Medium | cis | Network Security: Allow PKU2U authentication requests to this computer to use online identities = Disabled
+    HKLM:\System\CurrentControlSet\Control\Lsa\pku2u | AllowOnlineID | eq | 0 | DWord
+CIS-059 | reg | CIS security options | Medium | cis | Network security: Configure encryption types allowed for Kerberos = AES128_HMAC_SHA1, AES256_HMAC_SHA1, Future encryption types
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\kerberos\parameters | SupportedEncryptionTypes | eq | 2147483640 | DWord
+CIS-060 | reg | CIS security options | Low | cis | Network security: LDAP client encryption requirements = Negotiate sealing or higher
+    HKLM:\System\CurrentControlSet\Services\LDAP | LDAPClientConfidentiality | in | 1,2 | DWord | 1
+CIS-061 | reg | CIS security options | Low | cis | Network security: Restrict NTLM: Audit NTLM authentication in this domain = Enable all
+    HKLM:\System\CurrentControlSet\Services\Netlogon\Parameters | AuditNTLMInDomain | eq | 7 | DWord
+CIS-062 | reg | CIS security options | Low | cis | Shutdown: Allow system to be shut down without having to log on = Disabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | ShutdownWithoutLogon | eq | 0 | DWord
+CIS-063 | reg | CIS security options | Low | cis | System objects: Require case insensitivity for non-Windows subsystems = Enabled
+    HKLM:\System\CurrentControlSet\Control\Session Manager\Kernel | ObCaseInsensitive | eq | 1 | DWord
+CIS-064 | reg | CIS security options | Low | cis | User Account Control: Switch to the secure desktop when prompting for elevation = Enabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | PromptOnSecureDesktop | eq | 1 | DWord
+CIS-065 | reg | CIS firewall | Low | cis | Windows Firewall: Domain: Settings: Display a notification = No
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile | DisableNotifications | eq | 1 | DWord
+CIS-066 | reg | CIS firewall | Low | cis | Configure Windows Firewall: Domain: Logging: Name
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging | LogFilePath | eq | s:%SystemRoot%\System32\logfiles\firewall\domainfw.log | String
+CIS-067 | reg | CIS firewall | Low | cis | Windows Firewall: Domain: Logging: Size limit (KB) = 16,384 KB or greater
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging | LogFileSize | ge | 16384 | DWord | 16384
+CIS-068 | reg | CIS firewall | Low | cis | Windows Firewall: Private: Settings: Display a notification = No
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile | DisableNotifications | eq | 1 | DWord
+CIS-069 | reg | CIS firewall | Low | cis | Configure Windows Firewall: Private: Logging: Name
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging | LogFilePath | eq | s:%SystemRoot%\System32\logfiles\firewall\privatefw.log | String
+CIS-070 | reg | CIS firewall | Low | cis | Windows Firewall: Private: Logging: Size limit (KB) = 16,384 KB or greater
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging | LogFileSize | ge | 16384 | DWord | 16384
+CIS-071 | reg | CIS firewall | Low | cis | Windows Firewall: Public: Settings: Display a notification = No
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile | DisableNotifications | eq | 1 | DWord
+CIS-072 | reg | CIS firewall | Medium | manual | Windows Firewall: Public: Settings: Apply local firewall rules = No
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile | AllowLocalPolicyMerge | eq | 0 | DWord
+    how | Makes the Public profile ignore firewall rules created on this machine. Define the rules it needs in a GPO first.
+CIS-073 | reg | CIS firewall | Medium | manual | Windows Firewall: Public: Settings: Apply local connection security rules = No
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile | AllowLocalIPsecPolicyMerge | eq | 0 | DWord
+    how | Makes the Public profile ignore firewall rules created on this machine. Define the rules it needs in a GPO first.
+CIS-074 | reg | CIS firewall | Low | cis | Configure Windows Firewall: Public: Logging: Name
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging | LogFilePath | eq | s:%SystemRoot%\System32\logfiles\firewall\publicfw.log | String
+CIS-075 | reg | CIS firewall | Low | cis | Windows Firewall: Public: Logging: Size limit (KB) = 16,384 KB or greater
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging | LogFileSize | ge | 16384 | DWord | 16384
+CIS-076 | audit | CIS audit | Low | cis | Audit Application Group Management = Success and Failure
+    Application Group Management | {0cce9239-69ae-11d9-bed3-505054503030} | 3
+CIS-077 | audit | CIS audit | Low | cis | Audit Distribution Group Management = include Success
+    Distribution Group Management | {0cce9238-69ae-11d9-bed3-505054503030} | 1
+CIS-078 | audit | CIS audit | Medium | cis | Audit Logoff = include Success
+    Logoff | {0cce9216-69ae-11d9-bed3-505054503030} | 1
+CIS-079 | audit | CIS audit | Medium | cis | Audit IPsec Driver = Success and Failure
+    IPsec Driver | {0cce9213-69ae-11d9-bed3-505054503030} | 3
+CIS-080 | reg | CIS admin templates | Medium | cis | Prevent enabling lock screen camera = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization | NoLockScreenCamera | eq | 1 | DWord
+CIS-081 | reg | CIS admin templates | Medium | cis | Prevent enabling lock screen slide show = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization | NoLockScreenSlideshow | eq | 1 | DWord
+CIS-082 | reg | CIS admin templates | Low | cis | Allow users to enable online speech recognition services = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization | AllowInputPersonalization | eq | 0 | DWord
+CIS-083 | reg | CIS admin templates | Low | cis | Enable Certificate Padding = Enabled
+    HKLM:\SOFTWARE\Microsoft\Cryptography\Wintrust\Config | EnableCertPaddingCheck | eq | s:1 | String
+    HKLM:\SOFTWARE\Wow6432Node\Microsoft\Cryptography\Wintrust\Config | EnableCertPaddingCheck | eq | s:1 | String
+CIS-084 | reg | CIS admin templates | Low | cis | MSS: (AutoAdminLogon) Enable Automatic Logon = Disabled
+    HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon | AutoAdminLogon | eq | s:0 | String
+CIS-085 | reg | CIS admin templates | Low | cis | MSS: (SafeDllSearchMode) Enable Safe DLL search mode = Enabled
+    HKLM:\System\CurrentControlSet\Control\Session Manager | SafeDllSearchMode | eq | 1 | DWord
+CIS-086 | reg | CIS admin templates | Low | cis | MSS: (WarningLevel) Percentage threshold for the security event log at which the system will generate a warning = 90% or less
+    HKLM:\SYSTEM\CurrentControlSet\Services\Eventlog\Security | WarningLevel | le | 90 | DWord | 90
+CIS-087 | reg | CIS admin templates | Low | cis | Configure multicast DNS (mDNS) protocol = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient | EnableMDNS | eq | 0 | DWord
+CIS-088 | reg | CIS admin templates | Low | cis | Require Encryption = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation | RequireEncryption | eq | 1 | DWord
+CIS-089 | reg | CIS admin templates | Low | cis | Prohibit installation and configuration of Network Bridge on your DNS domain network = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Network Connections | NC_AllowNetBridge_NLA | eq | 0 | DWord
+CIS-090 | reg | CIS admin templates | Low | cis | Prohibit use of Internet Connection Sharing on your DNS domain network = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Network Connections | NC_ShowSharedAccessUI | eq | 0 | DWord
+CIS-091 | reg | CIS admin templates | Low | cis | Require domain users to elevate when setting a network's location = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Network Connections | NC_StdDomainUserSetLocation | eq | 1 | DWord
+CIS-092 | reg | CIS admin templates | Low | cis | Minimize the number of simultaneous connections to the Internet or a Windows Domain = 3 = Prevent Wi-Fi when on Ethernet
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy | fMinimizeConnections | eq | 3 | DWord
+CIS-093 | reg | CIS admin templates | Low | manual | Allow Print Spooler to accept client connections = Disabled
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers | RegisterSpoolerRemoteRpcEndPoint | eq | 2 | DWord
+    how | Stops printer sharing. Leave it on print servers; set it on the other servers by hand or in a GPO.
+CIS-094 | reg | CIS admin templates | Low | cis | Configure Redirection Guard = Redirection Guard Enabled
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers | RedirectionguardPolicy | eq | 1 | DWord
+CIS-095 | reg | CIS admin templates | Low | cis | Configure RPC connection settings: Protocol to use for outgoing RPC connections = RPC over TCP
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC | RpcUseNamedPipeProtocol | eq | 0 | DWord
+CIS-096 | reg | CIS admin templates | Low | cis | Configure RPC connection settings: Use authentication for outgoing RPC connections = Default
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC | RpcAuthentication | eq | 0 | DWord
+CIS-097 | reg | CIS admin templates | Low | cis | Configure RPC listener settings: Protocols to allow for incoming RPC connections = RPC over TCP
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC | RpcProtocols | eq | 5 | DWord
+CIS-098 | reg | CIS admin templates | Low | cis | Configure RPC listener settings: Authentication protocol to use for incoming RPC connections: = Negotiate or higher
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC | ForceKerberosForRpc | in | 0,1 | DWord | 0
+CIS-099 | reg | CIS admin templates | Low | cis | Configure RPC over TCP port = 0
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\RPC | RpcTcpPort | eq | 0 | DWord
+CIS-100 | reg | CIS admin templates | Low | cis | Manage processing of Queue-specific files = Limit Queue-specific files to Color profiles
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers | CopyFilesPolicy | eq | 1 | DWord
+CIS-101 | reg | CIS admin templates | Low | cis | Point and Print Restrictions: When installing drivers for a new connection = Show warning and elevation prompt
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint | NoWarningNoElevationOnInstall | eq | 0 | DWord
+CIS-102 | reg | CIS admin templates | Low | cis | Point and Print Restrictions: When updating drivers for an existing connection = Show warning and elevation prompt
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint | UpdatePromptSettings | eq | 0 | DWord
+CIS-103 | reg | CIS admin templates | Low | cis | Prevent automatic download of applications associated with device metadata = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Device Metadata | PreventDeviceMetadataFromNetwork | eq | 1 | DWord
+CIS-104 | reg | CIS admin templates | Low | cis | Enable / disable CLFS logfile authentication = Enabled
+    HKLM:\SYSTEM\CurrentControlSet\Policies | ClfsAuthenticationChecking | eq | 1 | DWord
+CIS-105 | reg | CIS admin templates | Low | cis | Configure security policy processing: Do not apply during periodic background processing = FALSE
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{827D319E-6EAC-11D2-A4EA-00C04F79F83A} | NoBackgroundPolicy | eq | 0 | DWord
+CIS-106 | reg | CIS admin templates | Low | cis | Configure security policy processing: Process even if the Group Policy objects have not changed = TRUE
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Group Policy\{827D319E-6EAC-11D2-A4EA-00C04F79F83A} | NoGPOListChanges | eq | 0 | DWord
+CIS-107 | reg | CIS admin templates | Low | cis | Continue experiences on this device = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | EnableCdp | eq | 0 | DWord
+CIS-108 | reg | CIS admin templates | Low | cis | Turn off background refresh of Group Policy = Disabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | DisableBkGndGroupPolicy | absent |  | DWord
+CIS-109 | reg | CIS admin templates | Medium | cis | Turn off downloading of print drivers over HTTP = Enabled
+    HKLM:\Software\Policies\Microsoft\Windows NT\Printers | DisableWebPnPDownload | eq | 1 | DWord
+CIS-110 | reg | CIS admin templates | Low | cis | Turn off Internet download for Web publishing and online ordering wizards = Enabled
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer | NoWebServices | eq | 1 | DWord
+CIS-111 | reg | CIS admin templates | Low | cis | Do not allow password expiration time longer than required by policy = Enabled
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PasswordExpirationProtectionEnabled | eq | 1 | DWord
+CIS-112 | reg | CIS admin templates | Low | cis | Enable password encryption = Enabled
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | ADPasswordEncryptionEnabled | eq | 1 | DWord
+CIS-113 | reg | CIS admin templates | Low | cis | Password Settings: Password Complexity = Large letters + small letters + numbers + specials or higher
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PasswordComplexity | in | 4,5,6,7,8 | DWord | 4
+CIS-114 | reg | CIS admin templates | Low | cis | Password Settings: Password Length = 15 or more
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PasswordLength | ge | 15 | DWord | 15
+CIS-115 | reg | CIS admin templates | Medium | cis | Password Settings: Password Age (Days) = 30 or fewer
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PasswordAgeDays | le | 30 | DWord | 30
+CIS-116 | reg | CIS admin templates | Low | cis | Post-authentication actions: Grace period (hours) = 8 or fewer hours, but not 0
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PostAuthenticationResetDelay | range | 1..8 | DWord | 8
+CIS-117 | reg | CIS admin templates | Low | cis | Post-authentication actions: Actions = Reset the password and logoff the managed account or higher
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PostAuthenticationActions | in | 3,5,11 | DWord | 3
+CIS-118 | reg | CIS admin templates | Low | cis | Allow Custom SSPs and APs to be loaded into LSASS = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | AllowCustomSSPsAPs | eq | 0 | DWord
+CIS-119 | reg | CIS admin templates | Low | cis | Block user from showing account details on sign-in = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | BlockUserFromShowingAccountDetailsOnSignin | eq | 1 | DWord
+CIS-120 | reg | CIS admin templates | Medium | cis | Do not display network selection UI = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | DontDisplayNetworkSelectionUI | eq | 1 | DWord
+CIS-121 | reg | CIS admin templates | Low | cis | Do not enumerate connected users on domain-joined computers = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | DontEnumerateConnectedUsers | eq | 1 | DWord
+CIS-122 | reg | CIS admin templates | Low | cis | Turn off app notifications on the lock screen = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | DisableLockScreenAppNotifications | eq | 1 | DWord
+CIS-123 | reg | CIS admin templates | Low | cis | Turn on convenience PIN sign-in = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\System | AllowDomainPINLogon | eq | 0 | DWord
+CIS-124 | reg | CIS admin templates | Low | cis | Block NetBIOS-based discovery for domain controller location = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Netlogon\Parameters | BlockNetbiosDiscovery | eq | 1 | DWord
+CIS-125 | reg | CIS admin templates | Medium | cis | Require a password when a computer wakes (on battery) = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51 | DCSettingIndex | eq | 1 | DWord
+CIS-126 | reg | CIS admin templates | Medium | cis | Require a password when a computer wakes (plugged in) = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51 | ACSettingIndex | eq | 1 | DWord
+CIS-127 | reg | CIS admin templates | Low | cis | Configure Offer Remote Assistance = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services | fAllowUnsolicited | eq | 0 | DWord
+CIS-128 | reg | CIS admin templates | Low | cis | Enable RPC Endpoint Mapper Client Authentication = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Rpc | EnableAuthEpResolution | eq | 1 | DWord
+CIS-129 | reg | CIS admin templates | Low | cis | Configure SAM change password RPC methods policy = Allow strong encryption change password RPC method only
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SAM | SamrChangeUserPasswordApiPolicy | eq | 2 | DWord
+CIS-130 | reg | CIS admin templates | Low | cis | Configure SAM change password RPC methods policy = Block all change password RPC methods
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SAM | SamrChangeUserPasswordApiPolicy | eq | 1 | DWord
+CIS-131 | reg | CIS admin templates | Low | cis | Configure validation of ROCA-vulnerable WHfB keys during authentication = Block
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SAM | SamNGCKeyROCAValidation | eq | 2 | DWord
+CIS-132 | reg | CIS admin templates | Low | cis | Enable Windows NTP Client = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\W32Time\TimeProviders\NtpClient | Enabled | eq | 1 | DWord
+CIS-133 | reg | CIS admin templates | Low | cis | Enable Windows NTP Server = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\W32Time\TimeProviders\NtpServer | Enabled | eq | 0 | DWord
+CIS-134 | reg | CIS admin templates | Low | cis | Not allow per-user unsigned packages to install by default (requires explicitly allow per install) = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx | DisablePerUserUnsignedPackagesByDefault | eq | 1 | DWord
+CIS-135 | reg | CIS admin templates | Low | cis | Allow Microsoft accounts to be optional = Enabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | MSAOptional | eq | 1 | DWord
+CIS-136 | reg | CIS admin templates | Low | cis | Configure enhanced anti-spoofing = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures | EnhancedAntiSpoofing | eq | 1 | DWord
+CIS-137 | reg | CIS admin templates | Low | cis | Turn off cloud consumer account state content = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent | DisableConsumerAccountStateContent | eq | 1 | DWord
+CIS-138 | reg | CIS admin templates | Low | cis | Require pin for pairing = First Time OR Always
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Connect | RequirePinForPairing | in | 1,2 | DWord | 1
+CIS-139 | reg | CIS admin templates | Low | cis | Do not display the password reveal button = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredUI | DisablePasswordReveal | eq | 1 | DWord
+CIS-140 | reg | CIS admin templates | Medium | cis | Enumerate administrator accounts on elevation = Disabled
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI | EnumerateAdministrators | eq | 0 | DWord
+CIS-141 | reg | CIS admin templates | Medium | cis | Allow Diagnostic Data = Diagnostic data off (not recommended) or Send required diagnostic data
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection | AllowTelemetry | in | 0,1 | DWord | 0
+CIS-142 | reg | CIS admin templates | Low | cis | Do not show feedback notifications = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection | DoNotShowFeedbackNotifications | eq | 1 | DWord
+CIS-143 | reg | CIS admin templates | Low | cis | Enable App Installer Experimental Features = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller | EnableExperimentalFeatures | eq | 0 | DWord
+CIS-144 | reg | CIS admin templates | Low | cis | Enable App Installer Hash Override = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller | EnableHashOverride | eq | 0 | DWord
+CIS-145 | reg | CIS admin templates | Low | cis | Enable App Installer Local Archive Malware Scan Override = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller | EnableLocalArchiveMalwareScanOverride | eq | 0 | DWord
+CIS-146 | reg | CIS admin templates | Low | cis | Enable App Installer Microsoft Store Source Certificate Validation Bypass = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller | EnableBypassCertificatePinningForMicrosoftStore | eq | 0 | DWord
+CIS-147 | reg | CIS admin templates | Low | cis | Enable App Installer ms-appinstaller protocol = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller | EnableMSAppInstallerProtocol | eq | 0 | DWord
+CIS-148 | reg | CIS admin templates | Low | cis | Application: Control Event Log behavior when the log file reaches its maximum size = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Application | Retention | eq | s:0 | String
+CIS-149 | reg | CIS admin templates | Low | cis | Security: Control Event Log behavior when the log file reaches its maximum size = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security | Retention | eq | s:0 | String
+CIS-150 | reg | CIS admin templates | Low | cis | Setup: Control Event Log behavior when the log file reaches its maximum size = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Setup | Retention | eq | s:0 | String
+CIS-151 | reg | CIS admin templates | Low | cis | System: Control Event Log behavior when the log file reaches its maximum size = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\System | Retention | eq | s:0 | String
+CIS-152 | reg | CIS admin templates | Medium | cis | Turn off Data Execution Prevention for Explorer = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer | NoDataExecutionPrevention | eq | 0 | DWord
+CIS-153 | reg | CIS admin templates | Low | cis | Turn off heap termination on corruption = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer | NoHeapTerminationOnCorruption | eq | 0 | DWord
+CIS-154 | reg | CIS admin templates | Medium | cis | Turn off shell protocol protected mode = Disabled
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer | PreXPSP2ShellProtocolBehavior | eq | 0 | DWord
+CIS-155 | reg | CIS admin templates | Low | cis | Block all consumer Microsoft account user authentication = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftAccount | DisableUserAuth | eq | 1 | DWord
+CIS-156 | reg | CIS admin templates | Low | cis | Require use of specific security layer for remote (RDP) connections = SSL
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services | SecurityLayer | eq | 2 | DWord
+CIS-157 | reg | CIS admin templates | Low | cis | Set time limit for active but idle Remote Desktop Services sessions = 15 minutes or less, but not Never (0)
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services | MaxIdleTime | range | 1..900000 | DWord | 900000
+CIS-158 | reg | CIS admin templates | Low | cis | Do not delete temp folders upon exit = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services | DeleteTempDirsOnExit | eq | 1 | DWord
+CIS-159 | reg | CIS admin templates | Low | cis | Do not use temporary folders per session = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services | PerSessionTempDir | eq | 1 | DWord
+CIS-160 | reg | CIS admin templates | Medium | cis | Prevent downloading of enclosures = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds | DisableEnclosureDownload | eq | 1 | DWord
+CIS-161 | reg | CIS admin templates | Low | cis | Allow Windows Ink Workspace = On, but disallow access above lock OR Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace | AllowWindowsInkWorkspace | in | 0,1 | DWord | 0
+CIS-162 | reg | CIS admin templates | Low | cis | Configure the transmission of the user's password in the content of MPR notifications sent by winlogon = Disabled
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System | EnableMPR | eq | 0 | DWord
+CIS-163 | reg | CIS admin templates | Low | cis | Prevent users from modifying settings = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\App and Browser protection | DisallowExploitProtectionOverride | eq | 1 | DWord
+CIS-164 | reg | CIS admin templates | Low | manual | No auto-restart with logged on users for scheduled automatic updates installations = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU | NoAutoRebootWithLoggedOnUsers | eq | 0 | DWord
+    how | Changes how this machine installs updates and when it restarts. Set it in the Group Policy or patch tool that manages updates.
+CIS-165 | reg | CIS admin templates | Low | manual | Configure Automatic Updates = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU | NoAutoUpdate | eq | 0 | DWord
+    how | Changes how this machine installs updates and when it restarts. Set it in the Group Policy or patch tool that manages updates.
+CIS-166 | reg | CIS admin templates | Low | manual | Configure Automatic Updates: Scheduled install day = 0 - Every day
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU | ScheduledInstallDay | eq | 0 | DWord
+    how | Changes how this machine installs updates and when it restarts. Set it in the Group Policy or patch tool that manages updates.
+CIS-167 | reg | CIS admin templates | Low | cis | Manage preview builds = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate | ManagePreviewBuildsPolicyValue | eq | 1 | DWord
+CIS-168 | reg | CIS admin templates | Low | manual | Select when Quality Updates are received = 0 days
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate | DeferQualityUpdates | eq | 1 | DWord
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate | DeferQualityUpdatesPeriodInDays | eq | 0 | DWord
+    how | Changes how this machine installs updates and when it restarts. Set it in the Group Policy or patch tool that manages updates.
+CIS-169 | reg | CIS admin templates | Low | cis | Disable HTTP proxy features: Disable WPAD = Checked
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp | DisableWpad | eq | 1 | DWord
+CIS-170 | reg | CIS admin templates | Low | cis | Disable HTTP proxy features: Disable proxy authentication = Disable authentication over loopback interfaces or higher
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings | DisableProxyAuthenticationSchemes | in | 256,287 | DWord | 256
+CIS-171 | sec | CIS user rights | Medium | cis | Generate security audits = LOCAL SERVICE, NETWORK SERVICE
+    Privilege Rights | SeAuditPrivilege | Generate security audits | only | m:*S-1-5-19;*S-1-5-20
+CIS-172 | sec | CIS user rights | Medium | cis | Impersonate a client after authentication = Administrators, LOCAL SERVICE, NETWORK SERVICE, SERVICE
+    Privilege Rights | SeImpersonatePrivilege | Impersonate a client after authentication | only | m:*S-1-5-32-544;*S-1-5-19;*S-1-5-20;*S-1-5-6
+CIS-173 | reg | CIS security options | Medium | cis | Domain controller: LDAP server signing requirements = Require signing
+    HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters | LDAPServerIntegrity | eq | 2 | DWord
+CIS-174 | reg | CIS admin templates | Low | cis | Password Settings: Password Complexity = Large letters + small letters + numbers + specials
+    HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS | PasswordComplexity | eq | 4 | DWord
+CIS-175 | reg | CIS admin templates | Medium | cis | Turn on Basic feed authentication over HTTP = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Internet Explorer\Feeds | AllowBasicAuthInClear | eq | 0 | DWord
+CIS-176 | reg | CIS Defender | Low | cis | Enable EDR in block mode = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features | PassiveRemediation | eq | 1 | DWord
+CIS-177 | reg | CIS Defender | Low | cis | Configure local setting override for reporting to Microsoft MAPS = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet | LocalSettingOverrideSpynetReporting | eq | 0 | DWord
+CIS-178 | reg | CIS Defender | Low | cis | Configure Attack Surface Reduction rules = Enabled
+    HKLM:\Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR | ExploitGuard_ASR_Rules | eq | 1 | DWord
+CIS-179 | reg | CIS Defender | Low | cis | Attack surface reduction rule 01443614-cd74-433a-b99e-2ecdc07bfc25 = block, audit or warn
+    HKLM:\Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules | 01443614-cd74-433a-b99e-2ecdc07bfc25 | in | 1,2,6 | String | 2
+CIS-180 | reg | CIS Defender | Low | cis | Attack surface reduction rule 33ddedf1-c6e0-47cb-833e-de6133960387 = block
+    HKLM:\Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules | 33ddedf1-c6e0-47cb-833e-de6133960387 | eq | s:1 | String
+CIS-181 | reg | CIS Defender | Low | cis | Enable file hash computation feature = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\MpEngine | EnableFileHashComputation | eq | 1 | DWord
+CIS-182 | reg | CIS Defender | Low | cis | Configure monitoring for incoming and outgoing file and program activity = bi-directional (full on access)
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection | RealtimeScanDirection | eq | 0 | DWord
+CIS-183 | reg | CIS Defender | Low | cis | Configure real-time protection and Security Intelligence Updates during OOBE = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection | OobeEnableRtpAndSigUpdate | eq | 1 | DWord
+CIS-184 | reg | CIS Defender | Low | cis | Monitor file and program activity on your computer = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection | DisableOnAccessProtection | eq | 0 | DWord
+CIS-185 | reg | CIS Defender | Low | cis | Turn on process scanning whenever real-time protection is enabled = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection | DisableScanOnRealtimeEnable | eq | 0 | DWord
+CIS-186 | reg | CIS Defender | Low | cis | Configure Remote Encryption Protection Mode = Audit or higher (BruteForceProtectionConfiguredState)
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Remediation\Behavioral Network Blocks\Brute Force Protection | BruteForceProtectionConfiguredState | in | 2,1 | DWord | 2
+CIS-187 | reg | CIS Defender | Low | cis | Configure Remote Encryption Protection Mode = Audit or higher (RemoteEncryptionProtectionConfiguredState)
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Remediation\Behavioral Network Blocks\Remote Encryption Protection | RemoteEncryptionProtectionConfiguredState | in | 2,1 | DWord | 2
+CIS-188 | reg | CIS Defender | Low | cis | Configure whether to report Dynamic Signature dropped events = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Reporting | EnableDynamicSignatureDroppedEventReporting | eq | 1 | DWord
+CIS-189 | reg | CIS Defender | Low | cis | Check for the latest virus and spyware security intelligence before running a scheduled scan = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | CheckForSignaturesBeforeRunningScan | eq | 1 | DWord
+CIS-190 | reg | CIS Defender | Low | cis | Scan archive files = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | DisableArchiveScanning | eq | 0 | DWord
+CIS-191 | reg | CIS Defender | Low | cis | Scan excluded files and directories during quick scans = 1
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | QuickScanIncludeExclusions | eq | 1 | DWord
+CIS-192 | reg | CIS Defender | Low | cis | Scan packed executables = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | DisablePackedExeScanning | eq | 0 | DWord
+CIS-193 | reg | CIS Defender | Low | cis | Specify the day of the week to run a scheduled scan = 0 or higher, but not 8
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | ScheduleDay | in | 0,1,2,3,4,5,6,7 | DWord | 0
+CIS-194 | reg | CIS Defender | Low | cis | Specify the scan type to use for a scheduled scan = Quick Scan (default) or higher
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | ScanParameters | in | 1,2 | DWord | 1
+CIS-195 | reg | CIS Defender | Low | cis | Specify the time for a daily quick scan = 1 or higher
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | ScheduleQuickScanTime | ge | 1 | DWord | 1
+CIS-196 | reg | CIS Defender | Low | cis | Specify the time of day to run a scheduled scan = 1 or higher
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | ScheduleTime | ge | 1 | DWord | 1
+CIS-197 | reg | CIS Defender | Low | cis | Trigger a quick scan after X days without any scans = 7
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | DaysUntilAggressiveCatchupQuickScan | eq | 7 | DWord
+CIS-198 | reg | CIS Defender | Low | cis | Turn on e-mail scanning = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan | DisableEmailScanning | eq | 0 | DWord
+CIS-199 | reg | CIS Defender | Low | cis | Specify the interval to check for security intelligence updates = 4 or fewer, but not 0
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates | SignatureUpdateInterval | in | 4,3,2,1 | DWord | 4
+CIS-200 | reg | CIS Defender | Low | cis | Specify threat alert levels at which default action should not be taken when detected = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Threats | Threats_ThreatSeverityDefaultAction | eq | 1 | DWord
+CIS-201 | reg | CIS Defender | Low | cis | Specify threat alert levels at which default action should not be taken when detected = Medium: 2 or 3
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Threats\ThreatSeverityDefaultAction | 2 | in | 2,3 | String | 2
+CIS-202 | reg | CIS Defender | Low | cis | Specify threat alert levels at which default action should not be taken when detected = High: 2 or 3
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Threats\ThreatSeverityDefaultAction | 4 | in | 2,3 | String | 2
+CIS-203 | reg | CIS Defender | Low | cis | Specify threat alert levels at which default action should not be taken when detected = Severe: 2 or 3
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Threats\ThreatSeverityDefaultAction | 5 | in | 2,3 | String | 2
+CIS-204 | reg | CIS Defender | Low | cis | Control whether exclusions are visible to local users = Enabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender | HideExclusionsFromLocalUsers | eq | 1 | DWord
+CIS-205 | reg | CIS Defender | Low | cis | Turn off routine remediation = Disabled
+    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender | DisableRoutinelyTakingAction | eq | 0 | DWord
+'@
+
+function ConvertFrom-CisValue([string]$Text) {
+    if ($Text -eq '') { return $null }
+    if ($Text.StartsWith('s:')) { return $Text.Substring(2) }
+    # the comma keeps a list a list (PowerShell unrolls arrays returned by a function)
+    if ($Text.StartsWith('m:')) { return , [string[]]@($Text.Substring(2) -split ';' | Where-Object { $_ }) }
+    if ($Text -match '^(\d+)\.\.(\d+)$') { return , @([long]$Matches[1], [long]$Matches[2]) }
+    if ($Text -match ',') { return , @($Text -split ',') }
+    [long]$Text
+}
+
+function Get-CisCatalog {
+    $list = New-Object Collections.Generic.List[hashtable]
+    $c = $null
+    foreach ($line in ($CisChecks -split "`r?`n")) {
+        if (-not $line.Trim()) { continue }
+        $f = @($line.Trim() -split '\s*\|\s*')
+        if ($line -match '^CIS-') {
+            $c = @{ id = $f[0]; kind = $f[1]; area = $f[2]; sev = $f[3]; fix = $f[4]; title = $f[5]; cisOnly = $true
+                    match = 'all'; scope = @(); items = @()
+                    why = 'CIS Benchmark Level 1 recommendation for this Windows version. It is not part of the Microsoft security baseline.'
+                    ms = 'not included (CIS Level 1 only)'
+                    impact = 'Not reviewed one by one for side effects: test it on one machine before applying it to many.' }
+            if ($c.area -eq 'CIS Defender') { $c.scope = @('defender') }
+            $list.Add($c)
+            continue
+        }
+        if ($f[0] -eq 'how') { $c.how = $f[1]; continue }
+        switch ($c.kind) {
+            'reg'   { $c.items += Reg $f[0] $f[1] (ConvertFrom-CisValue $f[3]) $f[2] -Type $f[4] -Set $(if ($f.Count -gt 5) { ConvertFrom-CisValue $f[5] } else { $null }) }
+            'sec'   { $c.items += Sec $f[0] $f[1] $f[2] (ConvertFrom-CisValue $f[4]) $f[3] -Set $(if ($f.Count -gt 5) { ConvertFrom-CisValue $f[5] } else { $null }) }
+            'audit' { $c.sub = $f[0]; $c.guid = $f[1]; $c.want = [int]$f[2] }
+        }
+    }
+    $list
+}
+
+# CIS recommendations or STIG IDs for one check, like '2.3.11.7 (L1)' or 'WN22-SO-000310 (CAT II)'
 function Get-CisRefs([string]$Id, [string]$Bench, [bool]$Dc) {
     if (-not $Bench) { return @() }
     if (-not $script:CisRows) {
@@ -416,7 +1136,9 @@ function Get-CisRefs([string]$Id, [string]$Bench, [bool]$Dc) {
             if ($f[0] -eq '#') { $cols = @($f | Select-Object -Skip 2); continue }
             if ($f.Count -lt 2) { continue }
             $row = @{}
-            for ($i = 0; $i -lt $cols.Count; $i++) { $row[$cols[$i]] = $f[$i + 1] }
+            for ($i = 0; $i -lt $cols.Count; $i++) {
+                $row[$cols[$i]] = if ($f[$i + 1] -eq '=' -and $i) { $row[$cols[$i - 1]] } else { $f[$i + 1] }
+            }
             $script:CisRows[$f[0]] = $row
         }
     }
@@ -428,7 +1150,7 @@ function Get-CisRefs([string]$Id, [string]$Bench, [bool]$Dc) {
         $r = $r -replace '!(dc|ms)$', ''
         $n, $lvl = $r -split '/'
         if (-not $lvl) { $lvl = 'L1' }
-        "$n ($lvl)"
+        if ($lvl -match '^I+$') { "$n (CAT $lvl)" } else { "$n ($lvl)" }
     }
 }
 
@@ -544,6 +1266,9 @@ function Test-Value($Value, $Want, [string]$Op) {
             'range'   { return ([long]$Value -ge [long]$Want[0] -and [long]$Value -le [long]$Want[1]) }
             'in'      { return (@($Want | ForEach-Object { "$_" }) -contains "$Value") }
             'minutes' { return ([long]$Value -eq -1 -or [long]$Value -ge [long]$Want) }
+            'ne'      { return ("$Value".Trim().Trim('"') -ne "$Want") }
+            'set'     { return (@($Value | Where-Object { "$_".Trim() }).Count -gt 0) }
+            'subset'  { return (@($Value | Where-Object { "$_".Trim() -and @($Want) -notcontains "$_".Trim() }).Count -eq 0) }
         }
     } catch { }
     $false
@@ -562,6 +1287,9 @@ function Format-Want($Want, [string]$Op) {
         'in'      { return (@($Want) -join ' or ') }
         'absent'  { return 'not set' }
         'minutes' { return ">= $Want (or -1: until an admin unlocks)" }
+        'ne'      { return "not $Want" }
+        'set'     { return 'any text' }
+        'subset'  { return $(if (@($Want).Count) { 'only: ' + (@($Want) -join ', ') } else { 'empty' }) }
     }
     Format-Value $Want
 }
@@ -599,6 +1327,9 @@ function Test-RegCheck($C) {
         } elseif ($r.exists) {
             $ok = Test-Value $r.value $i.want $i.op
             $now = Format-Value $r.value
+        } elseif ($i.op -eq 'subset') {
+            $ok = $true
+            $now = 'not set'
         } elseif ($null -ne $i.default) {
             $ok = Test-Value $i.default $i.want $i.op
             $now = 'not set (Windows default: ' + (Format-Value $i.default) + ')'
@@ -630,7 +1361,7 @@ function Set-RegCheck($C) {
         if ($i.op -eq 'absent') { Remove-RegValue $i.path $i.name; continue }
         $r = Get-RegValue $i.path $i.name
         if ($r.exists -and (Test-Value $r.value $i.want $i.op)) { continue }
-        $v = if ($null -ne $i.set) { $i.set } elseif ($i.want -is [array]) { $i.want[0] } else { $i.want }
+        $v = if ($null -ne $i.set) { $i.set } elseif ($i.want -is [array] -and $i.type -ne 'MultiString') { $i.want[0] } else { $i.want }
         Set-RegValue $i.path $i.name $v $i.type
     }
 }
@@ -1587,6 +2318,7 @@ function Test-Spooler($C) {
 }
 
 function Test-Scope($C, $H, $Ctx) {
+    if ($C.cisOnly -and -not (@($C.cis).Count + @($C.def).Count)) { return $false }
     foreach ($s in @($C.scope)) {
         switch ($s) {
             'server'   { if (-not $H.server) { return $false } }
@@ -1642,6 +2374,7 @@ function Get-FixText($C) {
     switch ($C.fix) {
         'safe'   { return "Fix: vulnagent-harden.ps1 -Apply safe -Only $($C.id)" }
         'review' { return "Test the impact first, then fix: vulnagent-harden.ps1 -Apply all -Only $($C.id)" }
+        'cis'    { return "Test the impact first, then fix: vulnagent-harden.ps1 -Apply cis -Only $($C.id)" }
     }
     "Fix by hand: $($C.how)"
 }
@@ -1653,8 +2386,11 @@ function ConvertTo-HardeningFinding($R, [bool]$Passed) {
     if ($c.impact) { $desc += "**Possible impact:** $($c.impact)" }
     if ($c.reboot) { $desc += '**Restart needed** after the change.' }
     if ($c.cisName) {
-        $desc += "**$($c.cisName):** " + $(if ($c.cis) { $c.cis -join ', ' } else { 'no matching recommendation' })
+        $desc += "**$($c.cisName):** " + $(if ($c.cis) { $c.cis -join ', ' } elseif ($c.def) { 'see the Defender Antivirus benchmark' } else { 'no matching recommendation' })
+        if ($c.cis -and $CisNotes[$c.id]) { $desc += "**CIS value:** $($CisNotes[$c.id])" }
     }
+    if ($c.def) { $desc += "**$($CisBenchmarks.defender):** " + ($c.def -join ', ') }
+    if ($c.stig) { $desc += "**$($c.stigName):** " + ($c.stig -join ', ') }
     if ($Passed) {
         $title = "$($c.title) (compliant)"; $sev = 'Info'; $uid = "harden-ok|$($c.id)"
         $mit = 'Nothing to do.'
@@ -1668,10 +2404,12 @@ function ConvertTo-HardeningFinding($R, [bool]$Passed) {
     New-Finding @{
         title = $title; severity = $sev; description = ($desc -join "`n"); mitigation = $mit
         references = 'https://www.microsoft.com/en-us/download/details.aspx?id=55319' +
-                     $(if ($c.cis) { "`nhttps://www.cisecurity.org/cis-benchmarks" } else { '' })
+                     $(if ($c.cis -or $c.def) { "`nhttps://www.cisecurity.org/cis-benchmarks" } else { '' }) +
+                     $(if ($c.stig) { "`nhttps://public.cyber.mil/stigs/" } else { '' })
         component_name = 'Windows hardening'; vuln_id_from_tool = $c.id; unique_id_from_tool = $uid
         tags = @(@('vulnagent', 'windows', 'hardening', ($c.area.ToLower() -replace ' ', '-'), "fix-$($c.fix)") +
-                 @($c.cis | ForEach-Object { 'cis-' + ($_ -replace '^.*\((\w+)\)$', '$1').ToLower() } | Select-Object -Unique))
+                 @(@($c.cis) + @($c.def) | Where-Object { $_ } | ForEach-Object { 'cis-' + ($_ -replace '^.*\((\w+)\)$', '$1').ToLower() } | Select-Object -Unique) +
+                 @($c.stig | Where-Object { $_ } | ForEach-Object { 'stig-' + ($_ -replace '^.*\((CAT \w+)\)$', '$1').ToLower().Replace(' ', '-') } | Select-Object -Unique))
     }
 }
 
@@ -1690,7 +2428,7 @@ function Get-StatusBadge($R) {
     '<span class="sev s-err">Error</span>'
 }
 
-$FixLabels = @{ safe = 'safe: -Apply safe'; review = 'review: -Apply all'; manual = 'by hand' }
+$FixLabels = @{ safe = 'safe: -Apply safe'; review = 'review: -Apply all'; cis = 'CIS: -Apply cis'; manual = 'by hand' }
 
 $HtmlStyle = @'
 body{font:14px/1.45 "Segoe UI",system-ui,sans-serif;background:#fff;color:#1d1d1f;margin:0 auto;padding:24px 16px;max-width:1300px}
@@ -1772,6 +2510,7 @@ function ConvertTo-HardeningHtml($Report, $Results) {
     $out.Add('<div class="mut">' + (($meta | ForEach-Object { Format-Html $_ }) -join ' &middot; ') + '</div>')
     $out.Add('<div class="mut">Compared with: ' + (Format-Html $Report.baseline) + '</div>')
     if ($Report.cis_benchmark) { $out.Add('<div class="mut">CIS numbers from: ' + (Format-Html $Report.cis_benchmark) + '</div>') }
+    if ($Report.stig_benchmark) { $out.Add('<div class="mut">STIG IDs from: ' + (Format-Html $Report.stig_benchmark) + '</div>') }
 
     if ($Report.errors) {
         $out.Add('<div class="warn"><b>Some checks or changes failed</b>, so this report may be incomplete:<ul>' +
@@ -1792,6 +2531,9 @@ function ConvertTo-HardeningHtml($Report, $Results) {
     $out.Add('<div class="cards">')
     $cls = if ($sum.score -ge 90) { 'good' } elseif ($sum.score -ge 70) { 'soon' } else { 'bad' }
     $out.Add('<div class="card"><span class="n ' + $cls + '">' + $sum.score + '%</span>compliant (' + $sum.passed + ' of ' + $sum.checks + ' checks)</div>')
+    if ($sum.cis_checks) {
+        $out.Add('<div class="card"><span class="n">' + $sum.cis_passed + ' / ' + $sum.cis_checks + '</span>CIS Level 1 checks outside the Microsoft baseline pass</div>')
+    }
     foreach ($s in $SeverityOrder.Keys) {
         $n = @($all | Where-Object { $_.status -eq 'fail' -and $_.severity -eq $s }).Count
         if ($s -eq 'Info' -and -not $n) { continue }
@@ -1820,7 +2562,10 @@ function ConvertTo-HardeningHtml($Report, $Results) {
         if ($c.how) { $det += '<b>How to fix:</b> ' + (Format-Html $c.how) + '<br>' }
         if ($c.reboot) { $det += '<b>Restart needed</b> after a change.<br>' }
         $det += '<b>Microsoft baseline:</b> ' + (Format-Html $c.ms)
-        if ($c.cisName) { $det += '<br><b>CIS:</b> ' + $(if ($c.cis) { Format-Html ($c.cis -join ', ') } else { 'no matching recommendation' }) }
+        if ($c.cisName) { $det += '<br><b>CIS:</b> ' + $(if ($c.cis) { Format-Html ($c.cis -join ', ') } elseif ($c.def) { 'see CIS Defender Antivirus below' } else { 'no matching recommendation' }) }
+        if ($c.cis -and $CisNotes[$c.id]) { $det += '<br><b>CIS value:</b> ' + (Format-Html $CisNotes[$c.id]) }
+        if ($c.def) { $det += '<br><b>CIS Defender Antivirus:</b> ' + (Format-Html ($c.def -join ', ')) }
+        if ($c.stig) { $det += '<br><b>DISA STIG:</b> ' + (Format-Html ($c.stig -join ', ')) }
         $title = (Format-Html $r.title) + $(if ($r.changed) { ' <span class="chg">(changed now)</span>' } else { '' })
         $fix = if ($r.status -eq 'pass') { '-' } else { $FixLabels[$r.fix] }
         '<tr data-key="' + $key + '"><td>' + (Get-StatusBadge $r) + '</td><td><details><summary><span class="mono">' + $r.id + '</span> ' + $title +
@@ -1829,7 +2574,7 @@ function ConvertTo-HardeningHtml($Report, $Results) {
     $out.Add('<div class="wrap"><table id="checks"><thead><tr><th>Status</th><th>Check (click for details)</th><th>Area</th><th>Fix</th></tr></thead><tbody>')
     $out.Add(($rows -join "`n"))
     $out.Add('</tbody></table></div>')
-    $out.Add('<p class="mut" style="margin-top:32px">Fix: "safe" can be applied with <span class="mono">-Apply safe</span>; "review" can break old clients or applications, test it, then use <span class="mono">-Apply all</span>; "by hand" needs hardware, Active Directory or a decision. Full data: C:\ProgramData\vulnagent\reports\hardening.json</p>')
+    $out.Add('<p class="mut" style="margin-top:32px">Fix: "safe" can be applied with <span class="mono">-Apply safe</span>; "review" can break old clients or applications, test it, then use <span class="mono">-Apply all</span>; "CIS" are CIS Level 1 settings outside the Microsoft baseline, test them, then use <span class="mono">-Apply cis</span>; "by hand" needs hardware, Active Directory or a decision. Full data: C:\ProgramData\vulnagent\reports\hardening.json</p>')
     $out.Add('<script>' + $HtmlScript + '</script></body></html>')
     $out -join "`n"
 }
@@ -1981,23 +2726,35 @@ function Invoke-Main {
         $hi = Get-HostInfo
         $ctx = New-Context
         $all = @(Get-Catalog $hi)
+        if ($cfg.cis_checks) { $all += @(Get-CisCatalog) }
         $bench = Get-CisBenchmark $hi
         $cisName = if ($bench) { $CisBenchmarks[$bench] } else { $null }
-        foreach ($c in $all) { $c.cisName = $cisName; $c.cis = @(Get-CisRefs $c.id $bench ([bool]$hi.dc)) }
+        $stigBench = Get-StigBenchmark $hi
+        $stigName = if ($stigBench) { $CisBenchmarks[$stigBench] } else { $null }
+        foreach ($c in $all) {
+            $c.cisName = $cisName; $c.cis = @(Get-CisRefs $c.id $bench ([bool]$hi.dc))
+            $c.def = @(Get-CisRefs $c.id 'defender' ([bool]$hi.dc))
+            $c.stigName = $stigName; $c.stig = @(Get-CisRefs $c.id $stigBench ([bool]$hi.dc))
+        }
         $catalog = @($all | Where-Object { Test-Scope $_ $hi $ctx })
         $accepted = @($cfg.hardening_exclude | Where-Object { $_ })
 
         if ($List) {
-            $catalog | ForEach-Object { [pscustomobject]@{ ID = $_.id; Severity = $_.sev; Fix = $_.fix; Area = $_.area; Check = $_.title; CIS = ($_.cis -join ', ') } } |
+            $catalog | ForEach-Object { [pscustomobject]@{ ID = $_.id; Severity = $_.sev; Fix = $_.fix; Area = $_.area; Check = $_.title
+                                                           CIS = ((@($_.cis) + @($_.def | ForEach-Object { "AV $_" })) -join ', '); STIG = ($_.stig -join ', ') } } |
                 Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
             Write-Host "$($catalog.Count) checks apply to this $($hi.role) (of $($all.Count))."
             Write-Host $(if ($cisName) { "CIS numbers: $cisName" } else { 'No CIS numbers for this Windows version.' })
+            Write-Host "AV: $($CisBenchmarks.defender)"
+            if ($stigName) { Write-Host "STIG IDs: $stigName" }
             return 0
         }
 
         Write-Log "vulnagent-harden $VERSION on $($hi.host): $($hi.os) build $($hi.build), $($hi.role)"
-        Write-Log "compared with $(Get-BaselineName $hi): $($catalog.Count) checks"
+        $nCis = @($catalog | Where-Object { $_.cisOnly }).Count
+        Write-Log ("compared with {0}: {1} checks{2}" -f (Get-BaselineName $hi), ($catalog.Count - $nCis), $(if ($nCis) { ", plus $nCis CIS Level 1 checks" } else { '' }))
         Write-Log $(if ($cisName) { "CIS numbers from $cisName" } else { 'no CIS numbers for this Windows version' })
+        if ($stigName) { Write-Log "STIG IDs from $stigName" }
         $errs = New-Object Collections.Generic.List[string]
         $undone = @()
         if ($Undo) {
@@ -2009,7 +2766,7 @@ function Invoke-Main {
         $changes = New-Object Collections.Generic.List[object]
         $restart = $false
         if ($Apply) {
-            $levels = if ($Apply -eq 'all') { @('safe', 'review') } else { @('safe') }
+            $levels = switch ($Apply) { 'all' { @('safe', 'review') } 'cis' { @('cis') } default { @('safe') } }
             $todo = @($results | Where-Object { $_.status -eq 'fail' -and $levels -contains $_.fix -and
                 (-not $Only -or (Test-IdMatch $_.id $_.area $Only)) -and -not (Test-IdMatch $_.id $_.area $Exclude) })
             $left = @($results | Where-Object { $_.status -eq 'fail' -and $_.fix -eq 'review' -and $Apply -eq 'safe' -and
@@ -2075,12 +2832,15 @@ function Invoke-Main {
         }
         $report = [ordered]@{
             agent = "vulnagent-harden $VERSION"; generated = (Get-Date).ToString('s'); host = $hi.host; system = $hi
-            baseline = (Get-BaselineName $hi); cis_benchmark = $cisName; errors = $errs.ToArray(); restart_needed = $restart
+            baseline = (Get-BaselineName $hi); cis_benchmark = $cisName; cis_defender_benchmark = $CisBenchmarks.defender; stig_benchmark = $stigName; errors = $errs.ToArray(); restart_needed = $restart
             changes = $changes.ToArray(); undone = $undone
             summary = [ordered]@{ checks = $applicable.Count; passed = $passed; failed = $failed.Count; score = $score
                                   exceptions = @($results | Where-Object { $_.status -eq 'exception' }).Count
-                                  errors = @($results | Where-Object { $_.status -eq 'error' }).Count }
-            results = @($results | Select-Object id, area, title, severity, fix, status, changed, error, @{ n = 'cis'; e = { ,@($_.check.cis) } }, items)
+                                  errors = @($results | Where-Object { $_.status -eq 'error' }).Count
+                                  cis_checks = @($applicable | Where-Object { $_.check.cisOnly }).Count
+                                  cis_passed = @($applicable | Where-Object { $_.check.cisOnly -and $_.status -eq 'pass' }).Count }
+            results = @($results | Select-Object id, area, title, severity, fix, status, changed, error, @{ n = 'cis'; e = { ,@($_.check.cis) } }, @{ n = 'cis_note'; e = { if ($_.check.cis) { $CisNotes[$_.id] } } },
+                                                     @{ n = 'cis_defender'; e = { ,@($_.check.def) } }, @{ n = 'stig'; e = { ,@($_.check.stig) } }, items)
         }
         Write-JsonFile (Join-Path $DataDir 'reports\hardening.json') $report
         Write-JsonFile (Join-Path $DataDir 'reports\hardening-findings.json') $doc
