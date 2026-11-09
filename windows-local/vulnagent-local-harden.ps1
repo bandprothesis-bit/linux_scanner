@@ -37,6 +37,15 @@
     in the Microsoft baseline (IDs CIS-001 and up; 30 of them for Defender on
     every Windows version). Turn them off with "cis_checks": false.
 
+    On machines with IIS or SQL Server, more checks cover their settings
+    (IDs IIS-01 and up, SQL-01 and up), with the DISA STIG IDs of the IIS 10.0
+    Server and Site STIGs and the SQL Server 2022 Instance STIG. They run only
+    where IIS or SQL Server is installed, and only report: the fix is a
+    command or a step by hand (two IIS registry settings can be applied with
+    -Apply all). The SQL Server checks connect to the local instances with the
+    account that runs the script. Turn them off with "iis_checks": false or
+    "sql_checks": false.
+
     Every check is marked:
       safe    can be applied without breaking a normal, current environment
       review  can break old clients or applications: test first
@@ -50,7 +59,7 @@
     changes: apply the Microsoft baseline GPOs there instead.
 
     Needs Windows PowerShell 5.1 and an elevated prompt (or SYSTEM). Makes no
-    network connections.
+    network connections, except to the local SQL Server instances.
 
     Exit codes: 0 done, 2 some checks or changes failed, 3 failed (no report
     written).
@@ -104,6 +113,8 @@ $DefaultConfig = [ordered]@{
     hardening_exclude        = @()                # accepted deviations: check IDs (wildcards allowed)
     hardening_include_passed = $false             # also list passed checks in hardening-findings.json, as Info
     cis_checks               = $true              # also check the CIS Level 1 settings outside the Microsoft baseline
+    iis_checks               = $true              # check the IIS settings, where IIS is installed
+    sql_checks               = $true              # check the SQL Server settings, where SQL Server is installed
     keep_reports_days        = 90                 # dated copies in reports\history; 0 keeps them all
 }
 
@@ -198,6 +209,8 @@ function Get-HostInfo {
         domain  = [bool]$cs.PartOfDomain
         role    = @('standalone workstation', 'domain member workstation', 'standalone server',
                     'domain member server', 'domain controller', 'domain controller')[$role]
+        iis     = $(try { Get-IisInfo } catch { $null })
+        sql     = @(try { Get-SqlInstances } catch { })
     }
 }
 
@@ -1142,7 +1155,7 @@ function Get-CisRefs([string]$Id, [string]$Bench, [bool]$Dc) {
 
 # Defender state, plus the audit and security policy (read once, when a check needs them)
 function New-Context {
-    $ctx = @{ defender = $false; mp = $null; mpMode = 'not installed' }
+    $ctx = @{ defender = $false; mp = $null; mpMode = 'not installed'; iisCache = @{}; iisSites = $null; iisPools = $null; services = $null; sql = @{} }
     try {
         $st = Get-MpComputerStatus
         $mode = "$($st.AMRunningMode)"
@@ -2303,6 +2316,681 @@ function Test-Spooler($C) {
     @{ ok = $ok; state = @{ start = $start; running = ("$($s.Status)" -eq 'Running') }; items = @(New-CheckItem 'Print Spooler service' $want $now $ok) }
 }
 
+# --------------------------------------------------------------------------
+# IIS and SQL Server: these checks run only on machines where they are installed
+# --------------------------------------------------------------------------
+
+# IIS: the version (10.0 on Windows Server 2016 and later), or $null when IIS is not installed
+function Get-IisInfo {
+    $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\InetStp' 'MajorVersion'
+    if (-not $v.exists -or -not (Get-Service W3SVC -ErrorAction SilentlyContinue)) { return $null }
+    "$($v.value).$([int](Get-RegValue 'HKLM:\SOFTWARE\Microsoft\InetStp' 'MinorVersion').value)"
+}
+
+# the SQL Server database engine instances on this machine
+function Get-SqlInstances {
+    $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server'
+    $names = Get-ItemProperty "$base\Instance Names\SQL" -ErrorAction SilentlyContinue
+    if (-not $names) { return }
+    foreach ($p in $names.PSObject.Properties) {
+        if ($p.Name -like 'PS*') { continue }
+        $setup = Get-ItemProperty "$base\$($p.Value)\Setup" -ErrorAction SilentlyContinue
+        $ver = if ($setup.PatchLevel) { "$($setup.PatchLevel)" } else { "$($setup.Version)" }
+        $default = $p.Name -eq 'MSSQLSERVER'
+        [pscustomobject]@{
+            name = $p.Name; id = "$($p.Value)"; version = $ver; major = [int](@("$ver" -split '\.')[0] -replace '\D', '0')
+            key = "$base\$($p.Value)"; server = $(if ($default) { '.' } else { ".\$($p.Name)" })
+        }
+    }
+}
+
+function Get-IisManager {
+    if (-not $script:IisManager) {
+        Add-Type -Path (Join-Path $env:windir 'System32\inetsrv\Microsoft.Web.Administration.dll')
+        $script:IisManager = New-Object Microsoft.Web.Administration.ServerManager
+    }
+    $script:IisManager
+}
+
+# a configuration element as a hashtable: attributes by name (enums and flags by their names),
+# the names of the attributes set in a configuration file under '@set', child elements by tag
+# name and the entries of a collection under '@items'
+function ConvertFrom-IisElement($E, [int]$Depth) {
+    $h = @{}
+    $set = @()
+    foreach ($a in $E.Attributes) {
+        $v = $a.Value
+        try {
+            $ev = @($a.Schema.GetEnumValues())
+            if ($ev.Count -and $null -ne $v -and "$v" -match '^\d+$') {
+                $n = [long]$v
+                $v = if ($a.Schema.Type -eq 'flags') {
+                    (@($ev | Where-Object { $_.Value -and ($n -band $_.Value) -eq $_.Value } | ForEach-Object { $_.Name }) -join ',')
+                } else { "$(@($ev | Where-Object { $_.Value -eq $n } | ForEach-Object { $_.Name })[0])" }
+            }
+        } catch { }
+        if (-not $a.IsInheritedFromDefaultValue) { $set += $a.Name }
+        $h[$a.Name] = $v
+    }
+    $h['@set'] = $set
+    if ($Depth -lt 5) {
+        foreach ($c in $E.ChildElements) { $h[$c.ElementTagName] = ConvertFrom-IisElement $c ($Depth + 1) }
+        if ($E.Schema.CollectionSchema) { $h['@items'] = @(foreach ($i in $E.GetCollection()) { ConvertFrom-IisElement $i ($Depth + 1) }) }
+    }
+    $h
+}
+
+# one configuration section, at the server level ($Site empty) or as one website sees it
+function Get-IisConfig([string]$Section, [string]$Site) {
+    $sm = Get-IisManager
+    $cfg = if ($Site) { $sm.GetWebConfiguration($Site) } else { $sm.GetApplicationHostConfiguration() }
+    ConvertFrom-IisElement $cfg.GetSection($Section) 0
+}
+
+function Get-IisSites {
+    foreach ($s in (Get-IisManager).Sites) {
+        $app = $s.Applications['/']
+        $vd = if ($app) { $app.VirtualDirectories['/'] } else { $null }
+        [pscustomobject]@{
+            name  = "$($s.Name)"
+            pool  = $(if ($app) { "$($app.ApplicationPoolName)" } else { '' })
+            path  = $(if ($vd) { [Environment]::ExpandEnvironmentVariables("$($vd.PhysicalPath)") } else { '' })
+            https = (@($s.Bindings | Where-Object { $_.Protocol -eq 'https' }).Count -gt 0)
+            log   = (ConvertFrom-IisElement $s.LogFile 0)
+        }
+    }
+}
+
+function Get-IisPools {
+    foreach ($p in (Get-IisManager).ApplicationPools) { [pscustomobject]@{ name = "$($p.Name)"; identity = "$($p.ProcessModel.IdentityType)" } }
+}
+
+# read once per run
+function Get-CtxIisSection($Ctx, [string]$Section, [string]$Site) {
+    $k = "$Site|$Section"
+    if (-not $Ctx.iisCache.ContainsKey($k)) { $Ctx.iisCache[$k] = Get-IisConfig $Section $Site }
+    $Ctx.iisCache[$k]
+}
+
+function Get-CtxIisSites($Ctx) {
+    if ($null -eq $Ctx.iisSites) { $Ctx.iisSites = @(Get-IisSites) }
+    $Ctx.iisSites
+}
+
+function Get-CtxIisPools($Ctx) {
+    if ($null -eq $Ctx.iisPools) { $Ctx.iisPools = @(Get-IisPools) }
+    $Ctx.iisPools
+}
+
+function Get-CtxServices($Ctx) {
+    if ($null -eq $Ctx.services) { $Ctx.services = @(Get-CimInstance Win32_Service) }
+    $Ctx.services
+}
+
+function Split-IisList($Value) { @("$Value" -split '\s*,\s*' | Where-Object { $_ }) }
+
+function New-ItemsResult($Items) {
+    @{ ok = (@($Items | Where-Object { -not $_.ok }).Count -eq 0); state = $null; items = @($Items) }
+}
+
+# ASP.NET is installed in IIS when its integration module is loaded
+function Test-IisAspNet($Ctx) {
+    @((Get-CtxIisSection $Ctx 'system.webServer/globalModules' '').'@items' | Where-Object { "$($_.name)" -like 'ManagedEngine*' }).Count -gt 0
+}
+
+# one item for the server level and one for each website; $Eval gets the section and returns @{ now; ok }
+function Get-IisItems($Ctx, [string]$Section, [string]$Label, [string]$Want, [scriptblock]$Eval, [switch]$ServerOnly) {
+    $places = @('')
+    if (-not $ServerOnly) { $places += @(Get-CtxIisSites $Ctx | ForEach-Object { $_.name }) }
+    $items = @(); $errs = @()
+    foreach ($p in $places) {
+        $where = if ($p) { "site $p" } else { 'server' }
+        try { $r = & $Eval (Get-CtxIisSection $Ctx $Section $p) }
+        catch { $errs += "${where}: $($_.Exception.Message)"; continue }
+        $now = if ("$($r.now)" -eq '') { 'not set' } else { "$($r.now)" }
+        $items += New-CheckItem "${where}: $Label" $Want $now ([bool]$r.ok)
+    }
+    if ($errs.Count) { throw ('could not read the IIS configuration: ' + ($errs -join '; ')) }
+    New-ItemsResult $items
+}
+
+# a log setting of a website: its own value when it sets one, otherwise the siteDefaults one
+function Get-IisSiteLog($Site, $Defaults, [string]$Attr) {
+    if (@($Site.log.'@set') -contains $Attr) { return $Site.log[$Attr] }
+    $Defaults[$Attr]
+}
+
+function Get-IisLogFields($Log) {
+    @(@($Log.customFields.'@items') | Where-Object { $_ } | ForEach-Object { "$($_.sourceType)/$($_.sourceName)" })
+}
+
+function ConvertTo-Minutes($Value) {
+    if ($Value -is [TimeSpan]) { return [int]$Value.TotalMinutes }
+    [int]([TimeSpan]::Parse("$Value")).TotalMinutes
+}
+
+function Test-RunningAsSystem {
+    try { [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem } catch { $false }
+}
+
+function Get-CurrentAccount {
+    try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "$env:USERDOMAIN\$env:USERNAME" }
+}
+
+# rows of a query on the local instance, as hashtables, with the Windows account that runs the script
+function Invoke-SqlQuery([string]$Server, [string]$Query) {
+    $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$Server;Database=master;Integrated Security=SSPI;" +
+        'Connect Timeout=15;TrustServerCertificate=True;Application Name=vulnagent')
+    try {
+        $cn.Open()
+        $cmd = $cn.CreateCommand()
+        $cmd.CommandText = $Query
+        $cmd.CommandTimeout = 60
+        $rd = $cmd.ExecuteReader()
+        $rows = New-Object Collections.Generic.List[hashtable]
+        while ($rd.Read()) {
+            $h = @{}
+            for ($i = 0; $i -lt $rd.FieldCount; $i++) { $h[$rd.GetName($i)] = $(if ($rd.IsDBNull($i)) { $null } else { $rd.GetValue($i) }) }
+            $rows.Add($h)
+        }
+        $rd.Close()
+        $rows.ToArray()
+    } finally { $cn.Dispose() }
+}
+
+# what the SQL Server checks need from one instance, queried once per run. These queries need
+# only what NT AUTHORITY\SYSTEM has by default (CONNECT SQL, VIEW ANY DATABASE): the logins and
+# server audits are visible only with VIEW ANY DEFINITION, and the checks say so when they are not.
+function Get-SqlFacts($Ctx, $I) {
+    if ($Ctx.sql.ContainsKey($I.name)) { return $Ctx.sql[$I.name] }
+    $perms = "SELECT permission_name AS p FROM fn_my_permissions(NULL, 'SERVER')"
+    if (-not (Test-RunningAsSystem)) { $perms = "EXECUTE AS LOGIN = N'NT AUTHORITY\SYSTEM'; $perms; REVERT;" }
+    $q = [ordered]@{
+        config  = 'SELECT name, CAST(value_in_use AS int) AS v FROM sys.configurations'
+        info    = "SELECT CAST(SERVERPROPERTY('IsClustered') AS int) AS clustered, CAST(SERVERPROPERTY('IsHadrEnabled') AS int) AS hadr, " +
+                  "HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION') AS viewdef"
+        sa      = 'SELECT name, CAST(is_disabled AS int) AS disabled FROM sys.sql_logins WHERE principal_id = 1'
+        logins  = "SELECT name FROM sys.sql_logins WHERE is_disabled = 0 AND sid <> 0x01 AND name NOT LIKE '##%##' AND (is_policy_checked = 0 OR is_expiration_checked = 0)"
+        trusted = "SELECT name FROM sys.databases WHERE is_trustworthy_on = 1 AND name <> 'msdb'"
+        audit   = 'SELECT DISTINCT d.audit_action_name AS a FROM sys.server_audit_specifications s JOIN sys.server_audits a ON s.audit_guid = a.audit_guid ' +
+                  'JOIN sys.server_audit_specification_details d ON s.server_specification_id = d.server_specification_id ' +
+                  "WHERE a.is_state_enabled = 1 AND s.is_state_enabled = 1 AND d.audit_action_name IN ('SUCCESSFUL_LOGIN_GROUP', 'FAILED_LOGIN_GROUP')"
+        perms   = $perms
+    }
+    $f = @{ errors = @{}; connect = $null }
+    foreach ($k in $q.Keys) {
+        if ($f.connect) { $f.errors[$k] = $f.connect; continue }
+        try { $f[$k] = @(Invoke-SqlQuery $I.server $q[$k]) }
+        catch {
+            $m = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim()
+            if ($k -eq 'config') { $f.connect = "could not connect to $($I.server) as $(Get-CurrentAccount): $m" ; $m = $f.connect }
+            $f.errors[$k] = $m
+        }
+    }
+    $Ctx.sql[$I.name] = $f
+    $f
+}
+
+function Get-SqlFact($F, [string]$Key) {
+    if ($F.errors.ContainsKey($Key)) { throw $F.errors[$Key] }
+    $F[$Key]
+}
+
+function Get-SqlConfig($F, [string]$Name) {
+    $row = @(Get-SqlFact $F 'config' | Where-Object { "$($_.name)" -eq $Name })
+    if ($row.Count) { return [int]$row[0].v }
+    $null
+}
+
+# one item (or more) per instance; $Test gets the instance and its facts and returns @{ label; want; now; ok }
+function Get-SqlItems($C, $Ctx, [scriptblock]$Test) {
+    $items = @(); $errs = @()
+    foreach ($i in @($C.instances)) {
+        try { $rs = @(& $Test $i (Get-SqlFacts $Ctx $i)) }
+        catch { $errs += "$($i.name): $($_.Exception.Message)"; continue }
+        foreach ($r in $rs) { $items += New-CheckItem "$($i.name): $($r.label)" $r.want $r.now ([bool]$r.ok) }
+    }
+    if ($errs.Count) { throw ($errs -join '; ') }
+    New-ItemsResult $items
+}
+
+# sys.configurations options, as 'name=value'; an option this SQL Server version does not have passes
+function Test-SqlOptions($C, $Ctx) {
+    $sqlOpts = @($C.options)
+    Get-SqlItems $C $Ctx {
+        param($I, $F)
+        foreach ($o in $sqlOpts) {
+            $name, $want = $o -split '='
+            $v = Get-SqlConfig $F $name
+            @{ label = $name; want = $want; now = $(if ($null -eq $v) { 'not in this version' } else { "$v" }); ok = ($null -eq $v -or "$v" -eq $want) }
+        }
+    }
+}
+
+function Get-AppCatalog($H, $Cfg) {
+    $appcmd = '%windir%\system32\inetsrv\appcmd.exe'
+    $Http = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
+    $sqlcfg = "In SQL Server: EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure '<option>', <value>; RECONFIGURE;"
+    $iis = @()
+    $sql = @()
+
+    if ($Cfg.iis_checks) { $iis = @(
+    @{ id = 'IIS-01'; sev = 'Medium'; stig = @('IIST-SV-000138 (CAT II)', 'IIST-SI-000231 (CAT II)')
+        title = 'Turn off directory browsing'
+        why = 'A directory listing shows every file in a folder, including backups and files that were never meant to be linked.'
+        how = "$appcmd set config /section:system.webServer/directoryBrowse /enabled:false, and the same with the site name for a website that turns it on."
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/directoryBrowse' 'directory browsing' 'off' { param($s) @{ now = $(if ("$($s.enabled)" -eq 'True') { 'on' } else { 'off' }); ok = "$($s.enabled)" -ne 'True' } } } }
+
+    @{ id = 'IIS-02'; sev = 'Medium'; stig = @('IIST-SV-000140 (CAT II)', 'IIST-SI-000233 (CAT II)')
+        title = 'Show detailed error pages only to local requests'
+        why = 'Detailed error pages show paths, modules and configuration to anyone who can cause an error.'
+        how = "$appcmd set config /section:system.webServer/httpErrors /errorMode:DetailedLocalOnly"
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/httpErrors' 'error pages (errorMode)' 'DetailedLocalOnly or Custom' { param($s) @{ now = $s.errorMode; ok = @('DetailedLocalOnly', 'Custom') -contains "$($s.errorMode)" } } } }
+
+    @{ id = 'IIS-03'; sev = 'Medium'; stig = @('IIST-SV-000125 (CAT II)')
+        title = 'Remove WebDAV publishing'
+        why = 'WebDAV lets clients create, change and move files on the web server.'
+        how = 'Uninstall-WindowsFeature Web-DAV-Publishing'
+        impact = 'Applications that publish or edit files through WebDAV stop working.'
+        get = { param($C, $Ctx)
+            $on = @((Get-CtxIisSection $Ctx 'system.webServer/globalModules' '').'@items' | Where-Object { "$($_.name)" -eq 'WebDAVModule' }).Count -gt 0
+            New-ItemsResult @(New-CheckItem 'WebDAV Publishing (WebDAVModule)' 'not installed' $(if ($on) { 'installed' } else { 'not installed' }) (-not $on)) } }
+
+    @{ id = 'IIS-04'; sev = 'Medium'; stig = @('IIST-SV-000124 (CAT II)', 'IIST-SI-000214 (CAT II)')
+        title = 'Remove the MIME types of shell programs (.exe, .dll, .com, .bat, .csh)'
+        why = 'With these MIME types, the server hands out executables and scripts that sit in the content folders.'
+        how = "$appcmd set config /section:staticContent /-`"[fileExtension='.exe']`", and the same for .dll, .com, .bat and .csh."
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/staticContent' 'MIME types for .exe .dll .com .bat .csh' 'none' {
+            param($s) $m = @($s.'@items' | ForEach-Object { "$($_.fileExtension)".ToLower() } | Where-Object { @('.exe', '.dll', '.com', '.bat', '.csh') -contains $_ })
+            @{ now = $(if ($m.Count) { $m -join ' ' } else { 'none' }); ok = ($m.Count -eq 0) } } } }
+
+    @{ id = 'IIS-05'; sev = 'Medium'; stig = @('IIST-SV-000103 (CAT II)', 'IIST-SI-000206 (CAT II)')
+        title = 'Log to both the log file and Event Tracing for Windows (ETW)'
+        why = 'ETW gives the log events in real time to monitoring tools, while the file keeps them.'
+        how = "$appcmd set config /section:system.applicationHost/sites /siteDefaults.logFile.logTargetW3C:`"File,ETW`" /commit:apphost (IIS Manager: server > Logging > Both log file and ETW event)."
+        get = { param($C, $Ctx)
+            $d = (Get-CtxIisSection $Ctx 'system.applicationHost/sites' '').siteDefaults.logFile
+            $want = 'File,ETW'
+            $places = @(@{ n = 'siteDefaults'; v = $d.logTargetW3C }) + @(Get-CtxIisSites $Ctx | ForEach-Object { @{ n = "site $($_.name)"; v = (Get-IisSiteLog $_ $d 'logTargetW3C') } })
+            New-ItemsResult @(foreach ($p in $places) { $l = Split-IisList $p.v
+                New-CheckItem "$($p.n): log destination" $want ($l -join ',') (($l -contains 'File') -and ($l -contains 'ETW')) }) } }
+
+    @{ id = 'IIS-06'; sev = 'Medium'; stig = @('IIST-SV-000110 (CAT II)', 'IIST-SV-000111 (CAT II)', 'IIST-SI-000209 (CAT II)', 'IIST-SI-000210 (CAT II)')
+        title = 'Log the user, client and result of each request'
+        why = 'Without the user name, user agent, referrer and these headers, the log cannot show who did what and whether it worked.'
+        how = 'IIS Manager: server > Logging > Format W3C > Select Fields: tick User Agent, User Name and Referer; add the custom fields Request Header Connection, Warning and Authorization, and Response Header Content-Type.'
+        get = { param($C, $Ctx)
+            $d = (Get-CtxIisSection $Ctx 'system.applicationHost/sites' '').siteDefaults.logFile
+            $std = @('UserAgent', 'UserName', 'Referer')
+            $cus = @('RequestHeader/Connection', 'RequestHeader/Warning', 'RequestHeader/Authorization', 'ResponseHeader/Content-Type')
+            $places = @(@{ n = 'siteDefaults'; format = $d.logFormat; flags = $d.logExtFileFlags; fields = @(Get-IisLogFields $d) })
+            foreach ($s in Get-CtxIisSites $Ctx) {
+                $f = @(Get-IisLogFields $s.log)
+                if (-not $f.Count) { $f = @(Get-IisLogFields $d) }
+                $places += @{ n = "site $($s.name)"; format = (Get-IisSiteLog $s $d 'logFormat'); flags = (Get-IisSiteLog $s $d 'logExtFileFlags'); fields = $f }
+            }
+            New-ItemsResult @(foreach ($p in $places) {
+                $miss = @()
+                if ("$($p.format)" -ne 'W3C') { $miss += "W3C format (now $($p.format))" }
+                $have = Split-IisList $p.flags
+                $miss += @($std | Where-Object { $have -notcontains $_ })
+                $miss += @($cus | Where-Object { @($p.fields) -notcontains $_ } | ForEach-Object { $t, $n = $_ -split '/'; "$n ($(($t -replace 'Header', '').ToLower()) header)" })
+                New-CheckItem "$($p.n): log fields" 'W3C with User Agent, User Name, Referer and the custom fields Connection, Warning, Authorization, Content-Type' $(if ($miss.Count) { 'missing: ' + ($miss -join ', ') } else { 'all logged' }) ($miss.Count -eq 0) }) } }
+
+    @{ id = 'IIS-07'; sev = 'Medium'; kind = 'reg'; fix = 'review'; reboot = $true; stig = @('IIST-SI-000270 (CAT II)')
+        title = 'Remove the HTTP.sys Server header'
+        why = 'The Server header (Microsoft-HTTPAPI/2.0) tells attackers which software and version answer.'
+        impact = 'Takes effect after the HTTP service or the machine restarts. Rarely, a client or monitoring check expects the header.'
+        items = @(Reg $Http 'DisableServerHeader' @(1, 2) -Op 'in' -Set 1) }
+
+    @{ id = 'IIS-08'; sev = 'Low'; minBuild = 17763
+        title = 'Remove the IIS Server header'
+        why = 'The Server header (Microsoft-IIS/10.0) tells attackers which software answers.'
+        how = "$appcmd set config /section:system.webServer/security/requestFiltering /removeServerHeader:true"
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'removeServerHeader' 'True' { param($s) @{ now = $s.removeServerHeader; ok = "$($s.removeServerHeader)" -eq 'True' } } } }
+
+    @{ id = 'IIS-09'; sev = 'Low'; stig = @('IIST-SV-000215 (CAT III)')
+        title = 'Remove the X-Powered-By header'
+        why = 'The header tells attackers that ASP.NET runs on the server.'
+        how = "$appcmd set config /section:system.webServer/httpProtocol /-`"customHeaders.[name='X-Powered-By']`""
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/httpProtocol' 'X-Powered-By header' 'removed' {
+            param($s) $on = @($s.customHeaders.'@items' | Where-Object { "$($_.name)" -eq 'X-Powered-By' }).Count -gt 0
+            @{ now = $(if ($on) { 'sent' } else { 'removed' }); ok = -not $on } } } }
+
+    @{ id = 'IIS-10'; sev = 'Low'; minBuild = 17763; stig = @('IIST-SV-000205 (CAT III)')
+        title = 'Turn on HTTP Strict Transport Security (HSTS)'
+        why = 'HSTS makes browsers use HTTPS only, so a first plain HTTP request cannot be intercepted or downgraded.'
+        how = "$appcmd set config /section:system.applicationHost/sites /siteDefaults.hsts.enabled:true /siteDefaults.hsts.max-age:31536000 /siteDefaults.hsts.includeSubDomains:true /siteDefaults.hsts.redirectHttpToHttps:true /commit:apphost"
+        impact = 'Browsers then refuse plain HTTP for the site and, with includeSubDomains, for all its subdomains. Every website and subdomain needs a working HTTPS binding first.'
+        get = { param($C, $Ctx)
+            $h = (Get-CtxIisSection $Ctx 'system.applicationHost/sites' '').siteDefaults.hsts
+            if (-not $h) { return New-ItemsResult @(New-CheckItem 'siteDefaults: HSTS' 'on' 'not available in this IIS version' $true) }
+            New-ItemsResult @(
+                (New-CheckItem 'siteDefaults: hsts enabled' 'True' "$($h.enabled)" ("$($h.enabled)" -eq 'True')),
+                (New-CheckItem 'siteDefaults: hsts max-age' 'more than 0' "$($h['max-age'])" ([long]"0$($h['max-age'])" -gt 0)),
+                (New-CheckItem 'siteDefaults: hsts includeSubDomains' 'True' "$($h.includeSubDomains)" ("$($h.includeSubDomains)" -eq 'True')),
+                (New-CheckItem 'siteDefaults: hsts redirectHttpToHttps' 'True' "$($h.redirectHttpToHttps)" ("$($h.redirectHttpToHttps)" -eq 'True'))) } }
+
+    @{ id = 'IIS-11'; sev = 'Medium'; stig = @('IIST-SV-000134 (CAT II)', 'IIST-SV-000135 (CAT II)', 'IIST-SI-000202 (CAT II)')
+        title = 'Keep ASP.NET session IDs in cookies, with a 15-minute time-out'
+        why = 'Session IDs in the URL end up in logs, browser history and referrer headers; a short time-out limits how long a stolen ID works.'
+        how = "$appcmd set config /section:system.web/sessionState /cookieless:UseCookies /timeout:00:15:00 (IIS Manager: server > Session State)."
+        impact = 'Users are signed out after 15 idle minutes.'
+        get = { param($C, $Ctx)
+            if (-not (Test-IisAspNet $Ctx)) { return New-ItemsResult @(New-CheckItem 'ASP.NET' 'not installed, or session state in cookies' 'not installed' $true) }
+            $r = Get-IisItems $Ctx 'system.web/sessionState' 'session state mode (cookieless)' 'UseCookies' { param($s) @{ now = $s.cookieless; ok = "$($s.cookieless)" -eq 'UseCookies' } }
+            $m = ConvertTo-Minutes (Get-CtxIisSection $Ctx 'system.web/sessionState' '').timeout
+            New-ItemsResult (@($r.items) + @(New-CheckItem 'server: session time-out' '15 minutes or less' "$m minutes" ($m -le 15))) } }
+
+    @{ id = 'IIS-12'; sev = 'Medium'; stig = @('IIST-SV-000137 (CAT II)')
+        title = 'Use SHA-2 for the ASP.NET machine key'
+        why = 'The machine key protects view state and forms authentication cookies; SHA-1 and MD5 validation can be forged more easily.'
+        how = "$appcmd set config /section:system.web/machineKey /validation:HMACSHA256 /decryption:Auto (IIS Manager: server > Machine Key)."
+        get = { param($C, $Ctx)
+            if (-not (Test-IisAspNet $Ctx)) { return New-ItemsResult @(New-CheckItem 'ASP.NET' 'not installed, or SHA-2' 'not installed' $true) }
+            $k = Get-CtxIisSection $Ctx 'system.web/machineKey' ''
+            New-ItemsResult @(
+                (New-CheckItem 'server: machineKey validation' 'HMACSHA256, HMACSHA384 or HMACSHA512' "$($k.validation)" (@('HMACSHA256', 'HMACSHA384', 'HMACSHA512') -contains "$($k.validation)")),
+                (New-CheckItem 'server: machineKey decryption' 'Auto' "$($k.decryption)" ("$($k.decryption)" -eq 'Auto'))) } }
+
+    @{ id = 'IIS-13'; sev = 'Medium'; kind = 'reg'; fix = 'review'; reboot = $true; stig = @('IIST-SV-000220 (CAT II)')
+        title = 'Turn on the HTTP request smuggling filter'
+        why = 'Without the filter, a request that a proxy and IIS read differently can be used to hijack other users'' requests.'
+        impact = 'HTTP.sys rejects ambiguous requests. Takes effect after the HTTP service or the machine restarts.'
+        items = @(Reg $Http 'DisableRequestSmuggling' 1) }
+
+    @{ id = 'IIS-14'; sev = 'Low'
+        title = 'Block TRACE requests'
+        why = 'TRACE echoes the request back, including headers, which can help cross-site tracing attacks.'
+        how = "$appcmd set config /section:system.webServer/security/requestFiltering /+`"verbs.[verb='TRACE',allowed='false']`""
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'TRACE requests' 'blocked' {
+            param($s) $t = @($s.verbs.'@items' | Where-Object { "$($_.verb)" -eq 'TRACE' })
+            $blocked = if ($t.Count) { "$($t[0].allowed)" -eq 'False' } else { "$($s.verbs.allowUnlisted)" -eq 'False' }
+            @{ now = $(if ($blocked) { 'blocked' } else { 'allowed' }); ok = $blocked } } } }
+
+    @{ id = 'IIS-15'; sev = 'Medium'; stig = @('IIST-SI-000229 (CAT II)')
+        title = 'Reject double-encoded URLs'
+        why = 'Double encoding is used to slip paths and characters past filters.'
+        how = "$appcmd set config /section:system.webServer/security/requestFiltering /allowDoubleEscaping:false"
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'allowDoubleEscaping' 'False' { param($s) @{ now = $s.allowDoubleEscaping; ok = "$($s.allowDoubleEscaping)" -eq 'False' } } } }
+
+    @{ id = 'IIS-16'; sev = 'Medium'; stig = @('IIST-SI-000228 (CAT II)')
+        title = 'Reject URLs with non-ASCII characters'
+        why = 'Non-ASCII characters in URLs are used to get around filters and to attack the URL parsers.'
+        how = "$appcmd set config /section:system.webServer/security/requestFiltering /allowHighBitCharacters:false"
+        impact = 'URLs with characters such as accented letters in file or folder names then get error 404.'
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'allowHighBitCharacters' 'False' { param($s) @{ now = $s.allowHighBitCharacters; ok = "$($s.allowHighBitCharacters)" -eq 'False' } } } }
+
+    @{ id = 'IIS-17'; sev = 'Medium'; stig = @('IIST-SI-000225 (CAT II)', 'IIST-SI-000226 (CAT II)', 'IIST-SI-000227 (CAT II)')
+        title = 'Limit the length of URLs and query strings and the size of requests'
+        why = 'Request limits protect against buffer overflows and requests that tie up the server.'
+        how = "$appcmd set config /section:system.webServer/security/requestFiltering /requestLimits.maxUrl:4096 /requestLimits.maxQueryString:2048 /requestLimits.maxAllowedContentLength:30000000"
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'request limits' 'maxUrl 4096, maxQueryString 2048, maxAllowedContentLength 2147483647 or less' {
+            param($s) $l = $s.requestLimits
+            @{ now = "maxUrl $($l.maxUrl), maxQueryString $($l.maxQueryString), maxAllowedContentLength $($l.maxAllowedContentLength)"
+               ok = ([long]"0$($l.maxUrl)" -le 4096 -and [long]"0$($l.maxQueryString)" -le 2048 -and [long]"0$($l.maxAllowedContentLength)" -le 2147483647) } } } }
+
+    @{ id = 'IIS-18'; sev = 'Medium'; stig = @('IIST-SI-000230 (CAT II)')
+        title = 'Allow only listed file extensions'
+        why = 'With unlisted extensions allowed, backups, configuration and other files the site never meant to serve can be requested.'
+        how = "List the extensions the site uses, for example $appcmd set config /section:requestFiltering /+`"fileExtensions.[fileExtension='.html',allowed='true']`", then $appcmd set config /section:requestFiltering /fileExtensions.allowUnlisted:false"
+        impact = 'Every file type the site serves must be listed first, including the extensionless URLs, or those requests get error 404.'
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/security/requestFiltering' 'unlisted file extensions' 'not allowed' {
+            param($s) $a = "$($s.fileExtensions.allowUnlisted)" -ne 'False'
+            @{ now = $(if ($a) { 'allowed' } else { 'not allowed' }); ok = -not $a } } } }
+
+    @{ id = 'IIS-19'; sev = 'Medium'; stig = @('IIST-SI-000234 (CAT II)')
+        title = 'Turn off ASP.NET debugging'
+        why = 'Debug compilation shows detailed errors and source details and slows the application.'
+        how = "$appcmd set config `"<site>`" /section:system.web/compilation /debug:false, or set debug=`"false`" in the site's web.config."
+        get = { param($C, $Ctx)
+            if (-not (Test-IisAspNet $Ctx)) { return New-ItemsResult @(New-CheckItem 'ASP.NET' 'not installed, or debugging off' 'not installed' $true) }
+            Get-IisItems $Ctx 'system.web/compilation' 'compilation debug' 'False' { param($s) @{ now = $s.debug; ok = "$($s.debug)" -ne 'True' } } } }
+
+    @{ id = 'IIS-20'; sev = 'Medium'; stig = @('IIST-SI-000251 (CAT II)')
+        title = 'Give each website its own application pool'
+        why = 'Websites that share a pool run in the same process and with the same identity, so one compromised site reaches the others.'
+        how = "Create a pool per website and assign it: $appcmd add apppool /name:<site>, then $appcmd set app `"<site>/`" /applicationPool:<site>"
+        get = { param($C, $Ctx)
+            $sites = @(Get-CtxIisSites $Ctx)
+            if (-not $sites.Count) { return New-ItemsResult @(New-CheckItem 'websites' 'own application pool' 'no websites' $true) }
+            New-ItemsResult @(foreach ($s in $sites) {
+                $others = @($sites | Where-Object { $_.pool -eq $s.pool -and $_.name -ne $s.name } | ForEach-Object { $_.name })
+                New-CheckItem "site $($s.name): application pool" 'used by this website only' $(if ($others.Count) { "$($s.pool), shared with " + ($others -join ', ') } else { $s.pool }) ($others.Count -eq 0) }) } }
+
+    @{ id = 'IIS-21'; sev = 'Medium'; stig = @('IIST-SI-000224 (CAT II)')
+        title = 'Keep website content off the system drive'
+        why = 'Content on the system drive can fill it up, and path traversal bugs reach the system files more easily.'
+        how = 'Move the content to another volume and change the physical path of the website (IIS Manager: site > Basic Settings).'
+        get = { param($C, $Ctx)
+            $sys = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+            $sites = @(Get-CtxIisSites $Ctx)
+            if (-not $sites.Count) { return New-ItemsResult @(New-CheckItem 'websites' 'content off the system drive' 'no websites' $true) }
+            New-ItemsResult @(foreach ($s in $sites) {
+                $on = $s.path -eq $sys -or $s.path -like "$sys\*"
+                New-CheckItem "site $($s.name): content folder" "not on $sys" $s.path (-not $on) }) } }
+
+    @{ id = 'IIS-22'; sev = 'Medium'
+        title = 'Run application pools under their own identity, not LocalSystem or a shared service account'
+        why = 'A pool running as LocalSystem gives full control of the machine to whoever compromises the website; NetworkService and LocalService are shared with other services.'
+        how = "$appcmd set apppool <pool> /processModel.identityType:ApplicationPoolIdentity (or a dedicated account)"
+        impact = 'The website then runs as IIS AppPool\<pool>, which needs read access to its content and, for network resources, its own rights.'
+        get = { param($C, $Ctx)
+            $pools = @(Get-CtxIisPools $Ctx)
+            if (-not $pools.Count) { return New-ItemsResult @(New-CheckItem 'application pools' 'own identity' 'no application pools' $true) }
+            New-ItemsResult @(foreach ($p in $pools) {
+                New-CheckItem "pool $($p.name): identity" 'ApplicationPoolIdentity or a dedicated account' $p.identity (@('LocalSystem', 'NetworkService', 'LocalService') -notcontains $p.identity) }) } }
+
+    @{ id = 'IIS-23'; sev = 'Low'
+        title = 'Do not allow unlisted ISAPI and CGI modules'
+        why = 'Only the ISAPI and CGI modules that were explicitly allowed should be able to run.'
+        how = "$appcmd set config /section:system.webServer/security/isapiCgiRestriction /notListedIsapisAllowed:false /notListedCgisAllowed:false"
+        get = { param($C, $Ctx)
+            $r = Get-CtxIisSection $Ctx 'system.webServer/security/isapiCgiRestriction' ''
+            New-ItemsResult @(
+                (New-CheckItem 'server: notListedIsapisAllowed' 'False' "$($r.notListedIsapisAllowed)" ("$($r.notListedIsapisAllowed)" -ne 'True')),
+                (New-CheckItem 'server: notListedCgisAllowed' 'False' "$($r.notListedCgisAllowed)" ("$($r.notListedCgisAllowed)" -ne 'True'))) } }
+
+    @{ id = 'IIS-24'; sev = 'Low'
+        title = 'Do not give handlers both write and script or execute access'
+        why = 'If uploaded files can also run, an attacker who can write a file can run code on the server.'
+        how = "$appcmd set config /section:system.webServer/handlers /accessPolicy:Read,Script"
+        get = { param($C, $Ctx) Get-IisItems $Ctx 'system.webServer/handlers' 'handler access policy' 'not Write together with Script or Execute' {
+            param($s) $a = Split-IisList $s.accessPolicy
+            @{ now = ($a -join ','); ok = -not (($a -contains 'Write') -and (($a -contains 'Script') -or ($a -contains 'Execute'))) } } } }
+    ) }
+
+    if ($Cfg.sql_checks) { $sql = @(
+    @{ id = 'SQL-01'; sev = 'Medium'; stig = @('SQLI-22-016200 (CAT II)')
+        title = 'Disable the sa login'
+        why = 'sa is the best-known SQL Server administrator login and the first one attackers try.'
+        how = 'In SQL Server: ALTER LOGIN [sa] DISABLE; (with its current name if it was renamed). Check first that no application signs in as sa.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $sa = @(Get-SqlFact $F 'sa')
+            if (-not $sa.Count) { throw 'the sa login is not visible to this account' }
+            @{ label = 'sa login'; want = 'disabled'; now = $(if ($sa[0].disabled) { 'disabled' } else { 'enabled' }) + " (name: $($sa[0].name))"; ok = [bool]$sa[0].disabled } } } }
+
+    @{ id = 'SQL-02'; sev = 'Medium'; stig = @('SQLI-22-016300 (CAT II)')
+        title = 'Rename the sa login'
+        why = 'Attackers guess passwords for the name sa; another name has to be found first.'
+        how = 'In SQL Server: ALTER LOGIN [sa] WITH NAME = [<new name>];'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $sa = @(Get-SqlFact $F 'sa')
+            if (-not $sa.Count) { throw 'the sa login is not visible to this account' }
+            @{ label = 'name of the sa login'; want = 'not sa'; now = "$($sa[0].name)"; ok = "$($sa[0].name)" -ne 'sa' } } } }
+
+    @{ id = 'SQL-03'; sev = 'Medium'; stig = @('SQLI-22-007200 (CAT II)'); options = @('xp_cmdshell=0')
+        title = 'Turn off xp_cmdshell'
+        why = 'xp_cmdshell runs operating system commands from SQL, with the rights of the SQL Server service.'
+        how = $sqlcfg.Replace('<option>', 'xp_cmdshell').Replace('<value>', '0')
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-04'; sev = 'Medium'; stig = @('SQLI-22-007300 (CAT II)'); options = @('clr enabled=0')
+        title = 'Turn off CLR integration unless an application needs it'
+        why = 'CLR assemblies run .NET code inside SQL Server.'
+        how = $sqlcfg.Replace('<option>', 'clr enabled').Replace('<value>', '0')
+        impact = 'Databases that use CLR assemblies (for example SSIS catalogs or some vendor applications) stop working: check with SELECT * FROM sys.assemblies WHERE is_user_defined = 1 in each database first.'
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-05'; sev = 'Medium'; stig = @('SQLI-22-017000 (CAT II)'); options = @('Ole Automation Procedures=0')
+        title = 'Turn off OLE Automation procedures'
+        why = 'OLE Automation procedures create COM objects from SQL, with the rights of the SQL Server service.'
+        how = $sqlcfg.Replace('<option>', 'Ole Automation Procedures').Replace('<value>', '0')
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-06'; sev = 'Medium'; stig = @('SQLI-22-017200 (CAT II)'); options = @('remote access=0')
+        title = 'Turn off remote access (remote stored procedure calls)'
+        why = 'Remote access lets other servers run stored procedures on this instance; it is deprecated and replaced by linked servers.'
+        how = $sqlcfg.Replace('<option>', 'remote access').Replace('<value>', '0')
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-07'; sev = 'Medium'
+        stig = @('SQLI-22-017700 (CAT II)', 'SQLI-22-017900 (CAT II)', 'SQLI-22-017500 (CAT II)', 'SQLI-22-017400 (CAT II)', 'SQLI-22-017600 (CAT II)', 'SQLI-22-016800 (CAT II)', 'SQLI-22-017100 (CAT II)')
+        options = @('external scripts enabled=0', 'replication xps=0', 'allow polybase export=0', 'hadoop connectivity=0', 'remote data archive=0', 'filestream access level=0', 'user options=0')
+        title = 'Turn off the SQL Server features that are not needed'
+        why = 'Every feature that is on (external scripts, replication procedures, PolyBase export, Hadoop, Stretch, FILESTREAM, user options) adds code that can be attacked.'
+        how = $sqlcfg + ' Turn off only the features that are not used: replication needs replication xps, and FILESTREAM databases need filestream access level.'
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-08'; sev = 'Low'
+        options = @('Ad Hoc Distributed Queries=0', 'cross db ownership chaining=0', 'scan for startup procs=0', 'remote admin connections=0', 'contained database authentication=0')
+        title = 'Turn off the server options that widen access'
+        why = 'Ad hoc distributed queries, cross-database ownership chaining, startup procedures, remote admin connections and contained database logins all open ways around the normal permissions.'
+        how = $sqlcfg + ' A failover cluster may need remote admin connections, and replication may need scan for startup procs.'
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-09'; sev = 'High'; stig = @('SQLI-22-007900 (CAT I)')
+        title = 'Use Windows Authentication, or make SQL logins follow the password policy and expiry'
+        why = 'SQL logins have their own passwords; without the Windows password policy they can be short, never expire and are never locked out.'
+        how = 'For each SQL login: ALTER LOGIN [<login>] WITH CHECK_POLICY = ON, CHECK_EXPIRATION = ON; or switch the instance to Windows Authentication mode (server Properties > Security) and restart it.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $want = 'Windows only, or SQL logins with CHECK_POLICY and CHECK_EXPIRATION'
+            if ([int](Get-RegValue "$($I.key)\MSSQLServer" 'LoginMode').value -eq 1) { return @{ label = 'authentication'; want = $want; now = 'Windows only'; ok = $true } }
+            if ([int]@(Get-SqlFact $F 'info')[0].viewdef -ne 1) {
+                return @{ label = 'authentication'; want = $want; now = 'Windows and SQL logins; the SQL logins are not visible to this account, check them as a SQL administrator'; ok = $false }
+            }
+            $bad = @(Get-SqlFact $F 'logins' | ForEach-Object { $_.name })
+            @{ label = 'authentication'; want = $want; ok = ($bad.Count -eq 0)
+               now = 'Windows and SQL logins; ' + $(if ($bad.Count) { 'without the password policy or expiry: ' + ($bad -join ', ') } else { 'all SQL logins use the policy and expiry' }) } } } }
+
+    @{ id = 'SQL-10'; sev = 'Medium'; stig = @('SQLI-22-014800 (CAT II)')
+        title = 'Audit successful and failed logins'
+        why = 'Without login auditing, password guessing and the use of stolen logins leave no trace.'
+        how = 'SSMS: server Properties > Security > Login auditing: Both failed and successful logins, then restart the SQL Server service. Or a server audit with SUCCESSFUL_LOGIN_GROUP and FAILED_LOGIN_GROUP.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $want = 'both failed and successful logins (or a server audit of both)'
+            $lvl = [int](Get-RegValue "$($I.key)\MSSQLServer" 'AuditLevel').value
+            $now = @('none', 'successful logins only', 'failed logins only', 'both failed and successful logins')[$lvl -band 3]
+            if (($lvl -band 3) -eq 3) { return @{ label = 'login auditing'; want = $want; now = $now; ok = $true } }
+            $groups = @(); $seen = $false
+            try { $groups = @(Get-SqlFact $F 'audit' | ForEach-Object { $_.a }); $seen = [int]@(Get-SqlFact $F 'info')[0].viewdef -eq 1 } catch { }
+            $both = ($groups -contains 'SUCCESSFUL_LOGIN_GROUP') -and ($groups -contains 'FAILED_LOGIN_GROUP')
+            $now += '; server audit: ' + $(if ($both) { 'logs both' } elseif ($seen) { 'does not log both' } else { 'not visible to this account' })
+            @{ label = 'login auditing'; want = $want; now = $now; ok = $both } } } }
+
+    @{ id = 'SQL-11'; sev = 'High'; stig = @('SQLI-22-008200 (CAT I)')
+        title = 'Force encrypted connections when SQL logins are used'
+        why = 'With SQL logins, the password crosses the network; without forced encryption and a proper certificate it can be captured.'
+        how = 'SQL Server Configuration Manager > SQL Server Network Configuration > Protocols for <instance> > Properties: on Certificate choose the server certificate, on Flags set Force Encryption to Yes; then restart the SQL Server service.'
+        impact = 'Clients that cannot use TLS 1.2, or do not trust the certificate, can no longer connect.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $want = 'Force Encryption on, with a certificate (not needed with Windows Authentication only)'
+            if ([int](Get-RegValue "$($I.key)\MSSQLServer" 'LoginMode').value -eq 1) { return @{ label = 'encryption'; want = $want; now = 'Windows Authentication only: not needed'; ok = $true } }
+            $nl = "$($I.key)\MSSQLServer\SuperSocketNetLib"
+            $fe = [int](Get-RegValue $nl 'ForceEncryption').value -eq 1
+            $cert = "$((Get-RegValue $nl 'Certificate').value)".Trim() -ne ''
+            @{ label = 'encryption'; want = $want; now = "Force Encryption $(if ($fe) { 'on' } else { 'off' }), certificate $(if ($cert) { 'set' } else { 'not set' })"; ok = ($fe -and $cert) } } } }
+
+    @{ id = 'SQL-12'; sev = 'Medium'; stig = @('SQLI-22-016000 (CAT II)')
+        title = 'Turn off customer feedback and error reporting to Microsoft'
+        why = 'Usage and error reports can contain details of the server and its data.'
+        how = 'Set CustomerFeedback and EnableErrorReporting to 0 under HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<instance ID>\CPE and HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<version, such as 160>, or use the SQL Server Error and Usage Reporting tool.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $on = @()
+            foreach ($k in @("$($I.key)\CPE", "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($I.major * 10)")) {
+                foreach ($n in 'CustomerFeedback', 'EnableErrorReporting') {
+                    $r = Get-RegValue $k $n
+                    if ($r.exists -and [int]$r.value -ne 0) { $on += "$(@($k -split '\\')[-1])\$n" }
+                }
+            }
+            @{ label = 'feedback and error reporting'; want = 'off'; now = $(if ($on.Count) { 'on: ' + ($on -join ', ') } else { 'off' }); ok = ($on.Count -eq 0) } } } }
+
+    @{ id = 'SQL-13'; sev = 'Medium'; stig = @('SQLI-22-017800 (CAT II)')
+        title = 'Disable the SQL Server Browser service unless named instances need it'
+        why = 'The Browser service answers on UDP 1434 and tells anyone which instances and ports the server has.'
+        how = 'Set-Service SQLBrowser -StartupType Disabled; Stop-Service SQLBrowser. Clients of named instances then connect with server,port.'
+        impact = 'Clients that connect to a named instance by name only (server\instance) stop finding it until they use the port.'
+        get = { param($C, $Ctx)
+            $b = @(Get-CtxServices $Ctx | Where-Object { $_.Name -eq 'SQLBrowser' })
+            if (-not $b.Count) { return New-ItemsResult @(New-CheckItem 'SQL Server Browser service' 'Disabled' 'not installed' $true) }
+            New-ItemsResult @(New-CheckItem 'SQL Server Browser service' 'Disabled' "$($b[0].StartMode), $($b[0].State)" ("$($b[0].StartMode)" -eq 'Disabled')) } }
+
+    @{ id = 'SQL-14'; sev = 'Medium'; stig = @('SQLI-22-012400 (CAT II)')
+        title = 'Run each SQL Server service under its own account'
+        why = 'A service running as LocalSystem, or sharing an account with another service, gives an attacker who takes over SQL Server more than that one service.'
+        how = 'SQL Server Configuration Manager > SQL Server Services > Properties > Log On: use the virtual account (NT SERVICE\<service>), a group managed service account or a dedicated domain account per service.'
+        get = { param($C, $Ctx)
+            $svc = @(Get-CtxServices $Ctx | Where-Object { $_.Name -match '^(MSSQLSERVER|SQLSERVERAGENT|MSSQLServerOLAPService|ReportServer|MSSQLFDLauncher|MSSQLLaunchpad|SQLPBDMS|SQLPBENGINE)$|^(MSSQL|SQLAgent|MSOLAP|ReportServer|MSSQLFDLauncher|MSSQLLaunchpad)\$|^MsDtsServer\d+$' })
+            if (-not $svc.Count) { return New-ItemsResult @(New-CheckItem 'SQL Server services' 'own account' 'none found' $true) }
+            New-ItemsResult @(foreach ($s in $svc) {
+                $a = "$($s.StartName)"
+                $builtin = $a -match '^(\.\\)?LocalSystem$|^NT AUTHORITY\\(SYSTEM|NETWORK ?SERVICE|LOCAL ?SERVICE)$'
+                $shared = ($a -notmatch '^NT SERVICE\\') -and @($svc | Where-Object { "$($_.StartName)" -eq $a -and $_.Name -ne $s.Name }).Count -gt 0
+                New-CheckItem "$($s.Name): account" 'its own account' $(if ($shared) { "$a (shared)" } else { $a }) (-not ($builtin -or $shared)) }) } }
+
+    @{ id = 'SQL-15'; sev = 'Medium'; stig = @('SQLI-22-004100 (CAT II)')
+        title = 'Do not give NT AUTHORITY\SYSTEM administrative rights in SQL Server'
+        why = 'Every service on the machine runs as SYSTEM; with administrative rights in SQL Server, any of them can read and change all databases.'
+        how = 'In SQL Server, remove NT AUTHORITY\SYSTEM (and any Windows group it belongs to, such as BUILTIN\Administrators) from sysadmin and revoke its other server permissions.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $info = @(Get-SqlFact $F 'info')[0]
+            $allowed = @('CONNECT SQL', 'VIEW ANY DATABASE')
+            if ([int]$info.hadr -eq 1) { $allowed += 'CREATE AVAILABILITY GROUP', 'ALTER ANY AVAILABILITY GROUP', 'VIEW SERVER STATE', 'VIEW SERVER PERFORMANCE STATE', 'VIEW SERVER SECURITY STATE' }
+            elseif ([int]$info.clustered -eq 1) { $allowed += 'VIEW SERVER STATE', 'VIEW SERVER PERFORMANCE STATE', 'VIEW SERVER SECURITY STATE' }
+            $extra = @(Get-SqlFact $F 'perms' | ForEach-Object { "$($_.p)" } | Where-Object { $allowed -notcontains $_ } | Sort-Object -Unique)
+            $now = if (-not $extra.Count) { 'nothing more' } elseif ($extra.Count -gt 6) { 'also ' + (($extra | Select-Object -First 6) -join ', ') + " and $($extra.Count - 6) more" } else { 'also ' + ($extra -join ', ') }
+            @{ label = 'permissions of NT AUTHORITY\SYSTEM'; want = 'only ' + ($allowed -join ', '); now = $now; ok = ($extra.Count -eq 0) } } } }
+
+    @{ id = 'SQL-16'; sev = 'Low'; options = @('default trace enabled=1')
+        title = 'Keep the default trace on'
+        why = 'The default trace records configuration changes, logins added and objects dropped; it is often the only record of what happened.'
+        how = $sqlcfg.Replace('<option>', 'default trace enabled').Replace('<value>', '1')
+        get = { param($C, $Ctx) Test-SqlOptions $C $Ctx } }
+
+    @{ id = 'SQL-17'; sev = 'Low'
+        title = 'Keep at least 12 SQL Server error logs'
+        why = 'With the default of 6, a few restarts are enough to delete the logs of an incident.'
+        how = 'SSMS: Management > SQL Server Logs > Configure: limit the number of error log files to 12 or more.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $r = Get-RegValue "$($I.key)\MSSQLServer" 'NumErrorLogs'
+            $n = if ($r.exists) { [int]$r.value } else { 6 }
+            @{ label = 'number of error logs'; want = '12 or more'; now = $(if ($r.exists) { "$n" } else { 'not set (default 6)' }); ok = ($n -ge 12) } } } }
+
+    @{ id = 'SQL-18'; sev = 'Medium'
+        title = 'Do not mark user databases TRUSTWORTHY'
+        why = 'In a TRUSTWORTHY database, its owner (often a sysadmin) can be impersonated by code in the database, which leads to sysadmin rights.'
+        how = 'In SQL Server: ALTER DATABASE [<database>] SET TRUSTWORTHY OFF; check first whether an application needs it.'
+        get = { param($C, $Ctx) Get-SqlItems $C $Ctx { param($I, $F)
+            $db = @(Get-SqlFact $F 'trusted' | ForEach-Object { $_.name })
+            @{ label = 'TRUSTWORTHY databases (except msdb)'; want = 'none'; now = $(if ($db.Count) { $db -join ', ' } else { 'none' }); ok = ($db.Count -eq 0) } } } }
+    ) }
+
+    foreach ($c in $iis) { $c.area = 'IIS'; $c.scope = @('iis'); $c.ms = 'not included (IIS setting)'
+                           $c.stigName = 'DISA STIG Microsoft IIS 10.0 Server V3R7 and Site V2R16' }
+    foreach ($c in $sql) { $c.area = 'SQL Server'; $c.scope = @('sql'); $c.ms = 'not included (SQL Server setting)'; $c.instances = @($H.sql)
+                           $c.stigName = 'DISA STIG Microsoft SQL Server 2022 Instance V1R4' }
+    $all = @($iis) + @($sql)
+    foreach ($c in $all) {
+        $c.app = $true
+        if (-not $c.kind) { $c.kind = 'custom' }
+        if (-not $c.fix) { $c.fix = 'manual' }
+        if (-not $c.match) { $c.match = 'all' }
+        if (-not $c.stig) { $c.stig = @() }
+        if (-not $c.stig.Count) { $c.stigName = $null }
+    }
+    $all
+}
+
 function Test-Scope($C, $H, $Ctx) {
     if ($C.cisOnly -and -not (@($C.cis).Count + @($C.def).Count)) { return $false }
     foreach ($s in @($C.scope)) {
@@ -2314,6 +3002,8 @@ function Test-Scope($C, $H, $Ctx) {
             'member'   { if (-not $H.domain -or $H.dc) { return $false } }
             'domain'   { if (-not $H.domain) { return $false } }
             'defender' { if (-not $Ctx.defender) { return $false } }
+            'iis'      { if (-not $H.iis) { return $false } }
+            'sql'      { if (-not @($H.sql).Count) { return $false } }
         }
     }
     -not ($C.minBuild -and $H.build -lt $C.minBuild)
@@ -2389,9 +3079,10 @@ function ConvertTo-HardeningFinding($R, [bool]$Passed) {
     }
     New-Finding @{
         title = $title; severity = $sev; description = ($desc -join "`n"); mitigation = $mit
-        references = 'https://www.microsoft.com/en-us/download/details.aspx?id=55319' +
+        references = $(if ($c.app) { $(if ($c.stig) { 'https://public.cyber.mil/stigs/' } else { '' }) } else {
+                     'https://www.microsoft.com/en-us/download/details.aspx?id=55319' +
                      $(if ($c.cis -or $c.def) { "`nhttps://www.cisecurity.org/cis-benchmarks" } else { '' }) +
-                     $(if ($c.stig) { "`nhttps://public.cyber.mil/stigs/" } else { '' })
+                     $(if ($c.stig) { "`nhttps://public.cyber.mil/stigs/" } else { '' }) })
         component_name = 'Windows hardening'; vuln_id_from_tool = $c.id; unique_id_from_tool = $uid
         tags = @(@('vulnagent', 'windows', 'hardening', ($c.area.ToLower() -replace ' ', '-'), "fix-$($c.fix)") +
                  @(@($c.cis) + @($c.def) | Where-Object { $_ } | ForEach-Object { 'cis-' + ($_ -replace '^.*\((\w+)\)$', '$1').ToLower() } | Select-Object -Unique) +
@@ -2498,6 +3189,7 @@ function ConvertTo-HardeningHtml($Report, $Results) {
     $out.Add('<div class="mut">Compared with: ' + (Format-Html $Report.baseline) + '</div>')
     if ($Report.cis_benchmark) { $out.Add('<div class="mut">CIS numbers from: ' + (Format-Html $Report.cis_benchmark) + '</div>') }
     if ($Report.stig_benchmark) { $out.Add('<div class="mut">STIG IDs from: ' + (Format-Html $Report.stig_benchmark) + '</div>') }
+    foreach ($a in @($Report.also_checked)) { $out.Add('<div class="mut">Also checked: ' + (Format-Html $a) + '</div>') }
 
     if ($Report.errors) {
         $out.Add('<div class="warn"><b>Some checks or changes failed</b>, so this report may be incomplete:<ul>' +
@@ -2553,7 +3245,7 @@ function ConvertTo-HardeningHtml($Report, $Results) {
         if ($c.cisName) { $det += '<br><b>CIS:</b> ' + $(if ($c.cis) { Format-Html ($c.cis -join ', ') } elseif ($c.def) { 'see CIS Defender Antivirus below' } else { 'no matching recommendation' }) }
         if ($c.cis -and $CisNotes[$c.id]) { $det += '<br><b>CIS value:</b> ' + (Format-Html $CisNotes[$c.id]) }
         if ($c.def) { $det += '<br><b>CIS Defender Antivirus:</b> ' + (Format-Html ($c.def -join ', ')) }
-        if ($c.stig) { $det += '<br><b>DISA STIG:</b> ' + (Format-Html ($c.stig -join ', ')) }
+        if ($c.stig) { $det += '<br><b>' + $(if ($c.app) { Format-Html $c.stigName } else { 'DISA STIG' }) + ':</b> ' + (Format-Html ($c.stig -join ', ')) }
         $title = (Format-Html $r.title) + $(if ($r.changed) { ' <span class="chg">(changed now)</span>' } else { '' })
         $fix = if ($r.status -eq 'pass') { '-' } else { $FixLabels[$r.fix] }
         '<tr data-key="' + $key + '"><td>' + (Get-StatusBadge $r) + '</td><td><details><summary><span class="mono">' + $r.id + '</span> ' + $title +
@@ -2728,17 +3420,24 @@ function Invoke-Main {
         $ctx = New-Context
         $all = @(Get-Catalog $hi)
         if ($cfg.cis_checks) { $all += @(Get-CisCatalog) }
+        $all += @(Get-AppCatalog $hi $cfg)
         $bench = Get-CisBenchmark $hi
         $cisName = if ($bench) { $CisBenchmarks[$bench] } else { $null }
         $stigBench = Get-StigBenchmark $hi
         $stigName = if ($stigBench) { $CisBenchmarks[$stigBench] } else { $null }
         foreach ($c in $all) {
+            if ($c.app) { $c.cis = @(); $c.def = @(); continue }
             $c.cisName = $cisName; $c.cis = @(Get-CisRefs $c.id $bench ([bool]$hi.dc))
             $c.def = @(Get-CisRefs $c.id 'defender' ([bool]$hi.dc))
             $c.stigName = $stigName; $c.stig = @(Get-CisRefs $c.id $stigBench ([bool]$hi.dc))
         }
         $catalog = @($all | Where-Object { Test-Scope $_ $hi $ctx })
         $accepted = @($cfg.hardening_exclude | Where-Object { $_ })
+        $nIis = @($catalog | Where-Object { $_.area -eq 'IIS' }).Count
+        $nSql = @($catalog | Where-Object { $_.area -eq 'SQL Server' }).Count
+        $alsoChecked = @()
+        if ($nIis) { $alsoChecked += "IIS $($hi.iis), $nIis checks (STIG IDs from DISA STIG Microsoft IIS 10.0 Server V3R7 and Site V2R16)" }
+        if ($nSql) { $alsoChecked += "SQL Server instances $((@($hi.sql) | ForEach-Object { "$($_.name) $($_.version)" }) -join ', '), $nSql checks (STIG IDs from DISA STIG Microsoft SQL Server 2022 Instance V1R4)" }
 
         if ($List) {
             $catalog | ForEach-Object { [pscustomobject]@{ ID = $_.id; Severity = $_.sev; Fix = $_.fix; Area = $_.area; Check = $_.title
@@ -2748,12 +3447,14 @@ function Invoke-Main {
             Write-Host $(if ($cisName) { "CIS numbers: $cisName" } else { 'No CIS numbers for this Windows version.' })
             Write-Host "AV: $($CisBenchmarks.defender)"
             if ($stigName) { Write-Host "STIG IDs: $stigName" }
+            foreach ($a in $alsoChecked) { Write-Host "Also checked: $a" }
             return 0
         }
 
         Write-Log "vulnagent-local-harden $VERSION on $($hi.host): $($hi.os) build $($hi.build), $($hi.role)"
         $nCis = @($catalog | Where-Object { $_.cisOnly }).Count
-        Write-Log ("compared with {0}: {1} checks{2}" -f (Get-BaselineName $hi), ($catalog.Count - $nCis), $(if ($nCis) { ", plus $nCis CIS Level 1 checks" } else { '' }))
+        Write-Log ("compared with {0}: {1} checks{2}" -f (Get-BaselineName $hi), ($catalog.Count - $nCis - $nIis - $nSql), $(if ($nCis) { ", plus $nCis CIS Level 1 checks" } else { '' }))
+        foreach ($a in $alsoChecked) { Write-Log "also checked: $a" }
         Write-Log $(if ($cisName) { "CIS numbers from $cisName" } else { 'no CIS numbers for this Windows version' })
         if ($stigName) { Write-Log "STIG IDs from $stigName" }
         $errs = New-Object Collections.Generic.List[string]
@@ -2834,13 +3535,14 @@ function Invoke-Main {
         }
         $report = [ordered]@{
             agent = "vulnagent-local-harden $VERSION"; generated = (Get-Date).ToString('s'); host = $hi.host; system = $hi
-            baseline = (Get-BaselineName $hi); cis_benchmark = $cisName; cis_defender_benchmark = $CisBenchmarks.defender; stig_benchmark = $stigName; errors = $errs.ToArray(); since_last = $since; restart_needed = $restart
+            baseline = (Get-BaselineName $hi); cis_benchmark = $cisName; cis_defender_benchmark = $CisBenchmarks.defender; stig_benchmark = $stigName; also_checked = $alsoChecked; errors = $errs.ToArray(); since_last = $since; restart_needed = $restart
             changes = $changes.ToArray(); undone = $undone
             summary = [ordered]@{ checks = $applicable.Count; passed = $passed; failed = $failed.Count; score = $score
                                   exceptions = @($results | Where-Object { $_.status -eq 'exception' }).Count
                                   errors = @($results | Where-Object { $_.status -eq 'error' }).Count
                                   cis_checks = @($applicable | Where-Object { $_.check.cisOnly }).Count
-                                  cis_passed = @($applicable | Where-Object { $_.check.cisOnly -and $_.status -eq 'pass' }).Count }
+                                  cis_passed = @($applicable | Where-Object { $_.check.cisOnly -and $_.status -eq 'pass' }).Count
+                                  iis_checks = $nIis; sql_checks = $nSql }
             results = @($results | Select-Object id, area, title, severity, fix, status, changed, error, @{ n = 'cis'; e = { ,@($_.check.cis) } }, @{ n = 'cis_note'; e = { if ($_.check.cis) { $CisNotes[$_.id] } } },
                                                      @{ n = 'cis_defender'; e = { ,@($_.check.def) } }, @{ n = 'stig'; e = { ,@($_.check.stig) } }, items)
         }

@@ -121,7 +121,7 @@ The `C:\ProgramData\vulnagent` folder is readable only by administrators, so a b
 
 The values are the newest baseline's, also on Windows Server 2016, 2019 and 2022. Settings that need a newer Windows than the machine has are skipped. On top of the baseline it checks Microsoft's guidance on TLS 1.0/1.1, PowerShell 2.0 and the Print Spooler.
 
-About 120 to 150 checks apply per machine:
+About 120 to 150 checks apply per machine, plus the CIS Level 1 checks and, where IIS or SQL Server is installed, their checks (see below):
 
 | Area | Examples |
 |---|---|
@@ -158,6 +158,25 @@ Keep in mind:
 - **13 are by hand only**: renaming the Administrator and Guest accounts and the logon message (they need your input), and settings that can stop a server from working: the Windows Update install and restart policy, printer sharing (Print Spooler client connections), ignoring local firewall rules on the Public profile, and restricting Remote Desktop logon to Administrators.
 - **Not checked:** the per-user recommendations (CIS section 19, about 10 settings under `HKEY_USERS`), because the task runs as SYSTEM and can't see every user's settings reliably, and all Level 2 recommendations.
 - **Turn them off** with `"cis_checks": false` in the config, to compare only with the Microsoft baseline.
+
+### IIS and SQL Server checks
+
+On machines with **IIS** or **SQL Server**, more checks cover their own settings. They run only where IIS (the W3SVC service) or a SQL Server database engine instance is installed. On other machines nothing changes.
+
+| Area | Checks | What they cover | STIG IDs from |
+|---|---|---|---|
+| `IIS` | `IIS-01` to `IIS-24` | Directory browsing, detailed error pages, WebDAV, MIME types of shell programs, logging (file and ETW, the fields logged), the Server and X-Powered-By headers, HSTS, ASP.NET session state, machine key and debugging, the request smuggling filter, request filtering (TRACE, double encoding, non-ASCII URLs, size limits, unlisted extensions), one application pool per website, content off the system drive, pool identities, ISAPI/CGI and handler permissions | DISA IIS 10.0 Server STIG V3R7 and Site STIG V2R16 |
+| `SQL Server` | `SQL-01` to `SQL-18`, for each instance | sa disabled and renamed; xp_cmdshell, CLR, OLE Automation, remote access and other unused features and options; Windows Authentication or the password policy for SQL logins; login auditing; forced encryption; feedback to Microsoft; the Browser service; service accounts; the rights of NT AUTHORITY\SYSTEM; the default trace; the number of error logs; TRUSTWORTHY databases | DISA SQL Server 2022 Instance STIG V1R4 |
+
+Keep in mind:
+
+- **They only report.** IIS and SQL Server settings are changed by hand: each finding says how (an `appcmd` command, a T-SQL statement, or the setting in IIS Manager, SSMS or SQL Server Configuration Manager). The exceptions are two IIS registry settings, `IIS-07` (the HTTP.sys Server header) and `IIS-13` (the request smuggling filter), which `-Apply all` applies and `-Undo` puts back. They take effect after the HTTP service or the machine restarts.
+- **The IIS checks** read the configuration at the server level and as each website sees it, including its `web.config`. The ASP.NET checks (`IIS-11`, `IIS-12`, `IIS-19`) pass when ASP.NET isn't installed. `IIS-08` and `IIS-10` need Windows Server 2019 or later.
+- **The SQL Server checks** read the registry and connect to each local instance with Windows authentication, as the account that runs the script: SYSTEM for the nightly task. They need only what NT AUTHORITY\SYSTEM has by default (CONNECT SQL and VIEW ANY DATABASE), and the STIG says it should have no more, which `SQL-15` checks. So SYSTEM can't see the SQL logins (`SQL-09`) or the server audits (`SQL-10`): when these matter, the checks say so and fail, and you check them by hand as a SQL administrator. When an instance is stopped or SYSTEM has no login in it, its query checks show as errors with the reason.
+- **Severity** comes from the STIG category (CAT I is High, CAT II Medium, CAT III Low); the checks without a STIG ID are Low or Medium. The STIG IDs are from the SQL Server 2022 STIG; instances of SQL Server 2016 to 2019 get the same checks.
+- **Some can affect applications.** Read the *Possible impact* of `IIS-10` (HSTS), `IIS-16` (non-ASCII URLs), `IIS-18` (only listed file extensions), `SQL-04` (CLR) and `SQL-11` (forced encryption) before you change them, and accept deviations with `hardening_exclude`.
+- In DefectDojo they have the tags `iis` or `sql-server`, and `stig-cat-i`, `stig-cat-ii` or `stig-cat-iii`.
+- **Turn them off** with `"iis_checks": false` or `"sql_checks": false` in the config.
 
 ### CIS Benchmark numbers and DISA STIG IDs
 
@@ -280,6 +299,8 @@ These checks then show as *Exception* in the report. They are not sent to Defect
 | `hardening_exclude` | `[]` | Hardening checks that are accepted deviations on this machine: IDs, patterns such as `"DEF-*"`, or areas such as `"Firewall"`. |
 | `hardening_include_passed` | `false` | Also send passed hardening checks, as Info, for a complete compliance record in DefectDojo. |
 | `cis_checks` | `true` | Also check the CIS Level 1 settings outside the Microsoft baseline (`CIS-001` and up). |
+| `iis_checks` | `true` | Check the IIS settings (`IIS-01` and up), where IIS is installed. |
+| `sql_checks` | `true` | Check the SQL Server settings (`SQL-01` and up), where SQL Server is installed. |
 
 ## Patching
 
@@ -319,5 +340,7 @@ On servers that WSUS or another patch tool already manages, leave it at `none` a
 | `hardening.log`: `X still fails after the change (a Group Policy may set it back)` | A domain GPO sets this setting to another value. Change it in the GPO, or add the check to `hardening_exclude`. |
 | `hardening.log`: `the audit policy could not be read` | `auditpol.exe` failed. Run the script as administrator or SYSTEM. |
 | Defender checks missing from the hardening report | Defender is not the active antivirus (passive mode, or another antivirus). Check `DEF-01`. |
+| `hardening.log`: `SQL-..: <instance>: could not connect to ...` | The SQL Server instance is stopped, or NT AUTHORITY\SYSTEM has no login in it (it has one by default). Start the instance or recreate the login with only CONNECT SQL; or set `sql_checks` to `false`. |
+| `hardening.log`: `IIS-..: could not read the IIS configuration` | A website's `web.config` is missing or not valid XML, or its folder is gone. The message names the website. |
 
 **WSUS note:** with WSUS, "missing" means approved in WSUS and not yet installed. Updates that nobody has approved in WSUS don't appear. To compare against everything Microsoft has released, set `windows_update_source` to `windows_update`. The server then needs internet access to Windows Update.
