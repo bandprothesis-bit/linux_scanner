@@ -41,6 +41,33 @@ The installer copies the two scripts to `C:\Program Files\vulnagent-local`, keep
 
 Running the installer again updates the scripts and keeps the config. It also moves the data of an earlier install from `C:\ProgramData\vulnagent-local` to `C:\vulnagent-local`.
 
+## Run without installing
+
+For a one-off check, or to try it first, run the two scripts straight from the extracted folder. Nothing is installed (no scheduled tasks, nothing in `C:\Program Files`). The reports go to the same `C:\vulnagent-local\reports` as after an install; the scripts create the folder the first time, readable only by SYSTEM and Administrators.
+
+In **PowerShell as administrator**, in the `windows-local` folder (only `vulnagent-local-scan.ps1` and `vulnagent-local-harden.ps1` are needed):
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force              # allow scripts in this window only
+.\vulnagent-local-scan.ps1 -Html $env:TEMP\scan.html          # 5 to 15 minutes (Windows Update search)
+.\vulnagent-local-harden.ps1 -Html $env:TEMP\hardening.html   # only reads, changes nothing
+ii $env:TEMP\scan.html; ii $env:TEMP\hardening.html
+```
+
+`-Html` writes an extra copy that a normal browser can open, since the reports folder is for administrators only.
+
+| | Installed | Run without installing |
+|---|---|---|
+| When it runs | Every night, as SYSTEM | Only when you start it, as your administrator account |
+| Reports | `C:\vulnagent-local\reports`, with history and changes since the last run | The same. A later install keeps them, so the history carries on. |
+| Who can read them | Administrators, plus the `-ReportReaders` group | Administrators only: use the `-Html` copy |
+| Removing it | `install-local.ps1 -Uninstall` | Delete the extracted folder, and `C:\vulnagent-local` if you don't need the reports |
+
+- **Everything else works the same** with the script in your folder instead of `C:\Program Files\vulnagent-local`: `-Apply`, `-Undo`, `-List` and `-InstallUpdates` (see [Run by hand](#run-by-hand)). The hardening backups are saved in `C:\vulnagent-local\hardening`, so `-Undo last` works too.
+- **Settings:** without a `config.json` the scripts use the defaults (see [Configuration](#configuration-cvulnagent-localconfigjson)). To change a setting, create `C:\vulnagent-local\config.json` with only the settings you want to change, or give your own file with `-ConfigPath`.
+- **From a file share or USB stick:** the scripts don't have to be copied to the machine. Run them by their full path, for example `& \\fileserver\tools\windows-local\vulnagent-local-scan.ps1`. The reports are still written on the machine itself.
+- **Before deleting `C:\vulnagent-local`:** it also holds the hardening backups. If you applied settings and may want to reverse them, run `-Undo` first.
+
 ## Install on many machines
 
 From an admin workstation, in the `windows-local` folder, as a user who is administrator on the targets (WinRM must be on; it is by default on domain-joined servers):
@@ -136,5 +163,6 @@ The Windows Update, end-of-life, winget and hardening messages are the same as i
 | Problem | Cause and fix |
 |---|---|
 | The browser says the file can't be opened, or access denied | The reports folder is for administrators only. See [Opening the reports](#opening-the-reports). |
+| `running scripts is disabled on this system`, or `is not digitally signed` | Run `Set-ExecutionPolicy -Scope Process Bypass -Force` in that window first. If a Group Policy sets the execution policy, this is ignored: sign the scripts or ask for an exception. |
 | `ERROR report index` in the log | The scan and the hardening check wrote `index.html` at the same moment. The next run fixes it; the reports themselves are complete. |
 | `index.html` shows fewer runs than expected | Older reports were deleted after `keep_reports_days`. |
