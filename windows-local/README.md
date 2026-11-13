@@ -6,10 +6,10 @@ Use it on machines that can't reach DefectDojo, where there is no DefectDojo, or
 
 | Script | What it does every night (scheduled task as SYSTEM) |
 |---|---|
-| `vulnagent-local-scan.ps1` | Missing Windows security updates, Windows version support, end-of-life or unpatched .NET, Java, Python, Node.js, PowerShell 7 and SQL Server, applications winget can upgrade, a pending restart, and expired or expiring certificates. |
+| `vulnagent-local-scan.ps1` | Missing Windows security updates, Windows version support, end-of-life or unpatched .NET, Java, Python, Node.js, PowerShell 7 and SQL Server, classic Outlook without the latest Office security release (CVE-2026-124194, exploited), applications winget can upgrade, a pending restart, and expired or expiring certificates. |
 | `vulnagent-local-harden.ps1` | About 130 settings compared with the Microsoft security baseline (Windows Server 2025 Member Server or Domain Controller, Windows 11), plus about 155 to 185 CIS Level 1 checks on Server 2022 and 2025 (and Server 2019 outside a domain), with the matching CIS Benchmark numbers (Stand-alone benchmarks for servers outside a domain, the Defender Antivirus benchmark) and, on Server 2019 and 2022, the DISA STIG IDs. Where IIS or SQL Server is installed, also 24 IIS and 18 SQL Server checks with their DISA STIG IDs. Changes nothing unless you run it with `-Apply`. |
 
-The checks, severities and hardening options are exactly those of the DefectDojo version: see [what is checked](../windows/README.md), [hardening](../windows/README.md#hardening-microsoft-security-baseline), [CIS and STIG references](../windows/README.md#cis-benchmark-numbers-and-disa-stig-ids) and [IIS and SQL Server checks](../windows/README.md#iis-and-sql-server-checks) there.
+The checks, severities and hardening options are exactly those of the DefectDojo version: see [what is checked](../windows/README.md), [Outlook check](../windows/README.md#outlook-check), [hardening](../windows/README.md#hardening-microsoft-security-baseline), [CIS and STIG references](../windows/README.md#cis-benchmark-numbers-and-disa-stig-ids) and [IIS and SQL Server checks](../windows/README.md#iis-and-sql-server-checks) there.
 
 Needs only Windows PowerShell 5.1 (built into Windows Server 2016 and later; install WMF 5.1 on 2012 R2). The scan connects only to Windows Update or WSUS, `endoflife.date` and winget's sources. The hardening check makes no network connections, except to the local SQL Server instances.
 
@@ -143,6 +143,7 @@ Exit codes, for both scripts: `0` done, `2` part of the run failed (the report m
 | `windows_update_source` | `default` | `default` (WSUS if configured, otherwise Windows Update), `windows_update` or `microsoft_update`. |
 | `include_non_security_updates` | `false` | Also list non-security updates, as Info. |
 | `include_runtimes` | `true` | The end-of-life and patch checks for .NET, Java, Python, Node.js, PowerShell and SQL Server. Set to `false` on machines without internet access. |
+| `include_outlook` | `true` | The [Outlook check](../windows/README.md#outlook-check). |
 | `include_winget` | `true` | Outdated applications, where winget is installed. |
 | `eol_warning_days` | `90` | Warn this many days before Windows support ends. |
 | `include_certificates` | `true` | The certificate check. |

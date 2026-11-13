@@ -14,6 +14,9 @@
         missing,
       * checks the Windows version, SQL Server, .NET, Java, Python, Node.js and
         PowerShell 7 against endoflife.date,
+      * checks classic Outlook (Microsoft 365 Apps, Office LTSC) for the
+        latest Office security release, which fixes CVE-2026-124194 (exploited)
+        and the critical Outlook bugs of November 2026, where Outlook is installed,
       * lists applications that winget can upgrade (when winget is present),
       * lists the machine's certificates (Personal, Web Hosting and Remote
         Desktop stores) and flags expired and soon-expiring ones,
@@ -64,6 +67,7 @@ $DefaultConfig = [ordered]@{
     windows_update_source        = 'default'          # default (WSUS if configured) | windows_update | microsoft_update
     include_non_security_updates = $false
     include_runtimes             = $true
+    include_outlook              = $true              # check classic Outlook for missing Office security releases
     include_winget               = $true
     eol_warning_days             = 90
     include_certificates         = $true
@@ -118,6 +122,53 @@ $RuntimeRules = @(
     @{ product = 'oracle-jdk';      label = 'Oracle Java';          cycle = 'major';  re = '^Java(\(TM\))? SE Development Kit (?<v>\d+(\.\d+)*)' }
     @{ product = 'eclipse-temurin'; label = 'Eclipse Temurin';      cycle = 'major';  re = '^Eclipse Temurin (JDK|JRE) with Hotspot (?<v>\d+[0-9u.+-]*)' }
 )
+
+# Classic Outlook: the Office builds of the latest security release that fix the Outlook
+# vulnerabilities, per update channel. Source:
+# https://learn.microsoft.com/officeupdates/microsoft365-apps-security-updates
+# A build is fixed when it is at least the listed build of the same version (the number
+# before the dot), or newer than every listed version.
+$OutlookAdvisory = @{
+    name      = 'November 2026'
+    released  = '2026-11-10'
+    exploited = @('CVE-2026-124194')
+    critical  = @('CVE-2026-110043', 'CVE-2026-110068', 'CVE-2026-111309')
+    cves      = @('CVE-2026-124194', 'CVE-2026-110043', 'CVE-2026-110068', 'CVE-2026-111309', 'CVE-2026-119993',
+                  'CVE-2026-119995', 'CVE-2026-119996', 'CVE-2026-119997', 'CVE-2026-123375', 'CVE-2026-123376',
+                  'CVE-2026-123377', 'CVE-2026-123378', 'CVE-2026-123379', 'CVE-2026-123380', 'CVE-2026-123381',
+                  'CVE-2026-123382', 'CVE-2026-123383', 'CVE-2026-123384', 'CVE-2026-123385', 'CVE-2026-124227',
+                  'CVE-2026-124228')
+    builds    = [ordered]@{
+        Current           = @('20527.20196')
+        MonthlyEnterprise = @('20527.20194', '20430.20264', '20326.20320')
+        SemiAnnual        = @('20527.20192', '20430.20262', '20326.20318')
+        LTSC2024          = @('17932.21140')
+        LTSC2021          = @('14334.21048')
+        LTSC2019          = @('10417.20236')
+    }
+    # Microsoft does not list these as affected by the exploited CVE
+    not_exploited = @('LTSC2019')
+}
+# Click-to-Run channel GUIDs (the last part of UpdateChannel or CDNBaseUrl) and policy names
+$OfficeChannels = @{
+    '492350f6-3a01-4f97-b9c0-c7c6ddf67d60' = 'Current';           '64256afe-f5d9-4f86-8936-8840a6a4f5be' = 'CurrentPreview'
+    '5440fd1f-7ecb-4221-8110-145efaa6372f' = 'Beta';              '55336b82-a18d-4dd6-b5f6-9e5095c314a6' = 'MonthlyEnterprise'
+    '7ffbc6bf-bc32-4f92-8982-f9dd17fd3114' = 'SemiAnnual';        'b8f9b850-328d-4355-9145-c59439a0c4cf' = 'SemiAnnualPreview'
+    'f2e724c1-748f-4b47-8fb8-8e0d210e9208' = 'LTSC2019';          '5030841d-c919-4594-8d2d-84ae4f96e58e' = 'LTSC2021'
+    '7983bac0-e531-40cf-be00-fd24fe66619c' = 'LTSC2024'
+    Current = 'Current'; FirstReleaseCurrent = 'CurrentPreview'; InsiderFast = 'Beta'; MonthlyEnterprise = 'MonthlyEnterprise'
+    Deferred = 'SemiAnnual'; FirstReleaseDeferred = 'SemiAnnualPreview'
+}
+$OfficeChannelNames = @{
+    Current = 'Current Channel'; CurrentPreview = 'Current Channel (Preview)'; Beta = 'Beta Channel'
+    MonthlyEnterprise = 'Monthly Enterprise Channel'; SemiAnnual = 'Semi-Annual Enterprise Channel'
+    SemiAnnualPreview = 'Semi-Annual Enterprise Channel (Preview)'
+    LTSC2019 = 'Office 2019 volume licensed'; LTSC2021 = 'Office LTSC 2021'; LTSC2024 = 'Office LTSC 2024'
+}
+# Outlook installed with Windows Installer (MSI): Office folder -> name, end of support
+$OutlookMsi = @{
+    Office16 = @('Outlook 2016', '2025-10-14'); Office15 = @('Outlook 2013', '2023-04-11'); Office14 = @('Outlook 2010', '2020-10-13')
+}
 
 # --------------------------------------------------------------------------
 # helpers
@@ -497,6 +548,85 @@ function Add-RuntimeStatus($Runtime, [datetime]$Today) {
 }
 
 # --------------------------------------------------------------------------
+# classic Outlook
+# --------------------------------------------------------------------------
+
+function Get-FileVersion([string]$Path) { "$((Get-Item -LiteralPath $Path).VersionInfo.ProductVersion)".Trim() }
+
+function Get-OfficeChannel($Config) {
+    $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate' -ErrorAction SilentlyContinue
+    foreach ($v in @($(if ($pol) { $pol.updatebranch }), $Config.UpdateChannel, $Config.CDNBaseUrl)) {
+        if (-not $v) { continue }
+        $k = ("$v".TrimEnd('/') -split '/')[-1].Trim().ToLower()
+        foreach ($n in $OfficeChannels.Keys) { if ($n.ToLower() -eq $k) { return $OfficeChannels[$n] } }
+    }
+    ''
+}
+
+# Click-to-Run (Microsoft 365 Apps, Office 2021/2024, LTSC) and MSI installs of classic Outlook.
+# The new Outlook (olk.exe) is a separate app and is not affected.
+function Get-OutlookInstalls {
+    $cfg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($cfg -and $cfg.VersionToReport) {
+        $base = if ($cfg.InstallationPath) { "$($cfg.InstallationPath)" } else { Join-Path $env:ProgramFiles 'Microsoft Office' }
+        $exe = @(Get-ChildItem -Path (Join-Path $base 'root\Office1*\OUTLOOK.EXE') -ErrorAction SilentlyContinue)[0]
+        if ($exe) {
+            $ch = Get-OfficeChannel $cfg
+            $upd = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Updates' -ErrorAction SilentlyContinue
+            [pscustomobject]@{
+                kind = 'c2r'; name = 'Microsoft Outlook'; version = "$($cfg.VersionToReport)".Trim(); channel = $ch
+                channel_name = $(if ($ch) { $OfficeChannelNames[$ch] } else { 'unknown channel' })
+                products = "$($cfg.ProductReleaseIds)"; path = $exe.FullName
+                pending = $(if ($upd -and $upd.UpdateToVersion) { "$($upd.UpdateToVersion)".Trim() } else { '' })
+            }
+        }
+    }
+    $dirs = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($d in $dirs) {
+        foreach ($exe in @(Get-ChildItem -Path (Join-Path $d 'Microsoft Office\Office1*\OUTLOOK.EXE') -ErrorAction SilentlyContinue)) {
+            $m = $OutlookMsi[$exe.Directory.Name]
+            if (-not $m) { continue }
+            [pscustomobject]@{
+                kind = 'msi'; name = $m[0]; version = (Get-FileVersion $exe.FullName); channel = ''; channel_name = 'Windows Installer (MSI)'
+                products = $m[0]; path = $exe.FullName; pending = ''; eol_date = $m[1]
+            }
+        }
+    }
+}
+
+# ok | vulnerable | eol | unknown, and the build that fixes it
+function Get-OutlookStatus($O) {
+    $a = $OutlookAdvisory
+    $r = [ordered]@{
+        kind = $O.kind; name = $O.name; version = $O.version; channel = $O.channel; channel_name = $O.channel_name
+        products = $O.products; path = $O.path; pending = $O.pending; status = 'unknown'; fixed_in = ''
+        eol_date = "$($O.eol_date)"; advisory = $a.name; exploited = $true
+    }
+    if ($O.kind -eq 'msi') { $r.status = 'eol'; return [pscustomobject]$r }
+    $p = @([regex]::Matches("$($O.version)", '\d+') | ForEach-Object { [long]$_.Value })
+    if ($p.Count -lt 4) { return [pscustomobject]$r }
+    $x = $p[2]; $y = $p[3]
+    $all = @($a.builds.Values | ForEach-Object { $_ })
+    $known = $O.channel -and $a.builds.Contains($O.channel)
+    $cands = if ($known) { @($a.builds[$O.channel]) } else { $all }
+    $num = { param($b) $q = $b -split '\.'; [long]$q[0] * 1000000 + [long]$q[1] }
+    $same = @($cands | Where-Object { [long]($_ -split '\.')[0] -eq $x } | Sort-Object { & $num $_ })
+    $maxX = ($all | ForEach-Object { [long]($_ -split '\.')[0] } | Measure-Object -Maximum).Maximum
+    if ($same) {
+        $r.fixed_in = '16.0.' + $same[0]
+        $r.status = if ($y -ge [long]($same[0] -split '\.')[1]) { 'ok' } else { 'vulnerable' }
+    } elseif ($x -gt $maxX) {
+        $r.status = 'ok'
+    } else {
+        # an older version that no longer gets security updates on this channel
+        $r.fixed_in = '16.0.' + @($cands | Sort-Object { & $num $_ } -Descending)[0]
+        $r.status = 'vulnerable'
+    }
+    if ($known -and @($a.not_exploited) -contains $O.channel) { $r.exploited = $false }
+    [pscustomobject]$r
+}
+
+# --------------------------------------------------------------------------
 # winget
 # --------------------------------------------------------------------------
 
@@ -734,6 +864,52 @@ function ConvertTo-AppFinding($A) {
     }
 }
 
+function ConvertTo-OutlookFinding($O) {
+    $a = $OutlookAdvisory
+    $ids = @($a.cves | Where-Object { $O.exploited -or $a.exploited -notcontains $_ })
+    $desc = @("**Installed:** $($O.name) ($($O.channel_name))")
+    if ($O.products -and $O.kind -eq 'c2r') { $desc += "**Office products:** $($O.products)" }
+    $desc += "**Build:** $($O.version)"
+    if ($O.status -eq 'eol') {
+        $title = "$($O.name) is end-of-life and gets no fix for the $($a.name) Outlook vulnerabilities"
+        $sev = 'High'
+        $desc += "**End of support:** $($O.eol_date). Microsoft releases no security updates for it, including the $($a.name) Outlook fixes."
+        $mit = 'Replace it with a supported Outlook (Microsoft 365 Apps or Office LTSC 2024), then remove the old Office. ' +
+               'Until then, block outbound SMB (TCP 445) to the internet.'
+    } else {
+        $title = "Microsoft Outlook is missing the $($a.name) security update" +
+                 $(if ($O.exploited) { " ($($a.exploited -join ', '), exploited)" } else { '' })
+        $sev = if ($O.exploited) { 'Critical' } else { 'High' }
+        $desc += "**Fixed in:** $($O.fixed_in) or later (Office security release of $($a.released))"
+        if ($O.exploited) {
+            $desc += "**Exploited:** $($a.exploited -join ', '): opening a crafted file makes Outlook connect to an attacker's server without the usual warning and leaks the user's NTLMv2 hash. Listed in CISA's Known Exploited Vulnerabilities catalog."
+        } else {
+            $desc += "**Exploited:** Microsoft does not list $($O.channel_name) as affected by $($a.exploited -join ', ')."
+        }
+        $desc += "**Critical:** $($a.critical -join ', '): remote code execution; some run code when a message is only shown in the Reading Pane."
+        $mit = "Update Office to $($O.fixed_in) or later: in Outlook, File > Office Account > Update Options > Update Now, " +
+               'or run "C:\Program Files\Common Files\microsoft shared\ClickToRun\OfficeC2RClient.exe" /update user, or approve it in your Office update tool. ' +
+               'Outlook must be closed and reopened. Until then, block outbound SMB (TCP 445) to the internet.'
+        if ($O.pending -and (Compare-Version $O.pending $O.fixed_in) -ge 0) {
+            $desc += "**Update waiting:** $($O.pending) is downloaded and installs when the Office apps are closed."
+            $mit += " Build $($O.pending) is already downloaded: close the Office apps or restart."
+        }
+    }
+    $desc += '**Outlook CVEs in this release:** ' + ($ids -join ', ')
+    $desc += "**Path:** $($O.path)"
+    New-Finding @{
+        title = $title; severity = $sev; description = ($desc -join "`n"); mitigation = $mit
+        references = (@("https://msrc.microsoft.com/update-guide/vulnerability/$($a.exploited[0])",
+                        'https://learn.microsoft.com/officeupdates/microsoft365-apps-security-updates',
+                        'https://www.cisa.gov/known-exploited-vulnerabilities-catalog') -join "`n")
+        component_name = $O.name; component_version = $O.version; file_path = $O.path
+        vuln_id_from_tool = $(if ($O.status -eq 'eol') { 'outlook-eol' } else { $a.exploited[0] })
+        unique_id_from_tool = 'outlook|{0}|{1}|{2}' -f $a.released, $O.status, $O.path
+        vulnerability_ids = $ids
+        tags = @('vulnagent', 'windows', 'outlook', 'office', $(if ($O.status -eq 'eol') { 'end-of-life' } elseif ($O.exploited) { 'exploited' } else { 'missing-update' }))
+    }
+}
+
 function ConvertTo-CertFinding($C, [int]$WarnDays) {
     # the title names the expiry band, so the finding is replaced (old one closed)
     # when the certificate moves to a more urgent band
@@ -776,7 +952,7 @@ function ConvertTo-CertFinding($C, [int]$WarnDays) {
 
 $SeverityOrder = [ordered]@{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
 $FindingKinds = [ordered]@{
-    'windows-update' = 'Windows Update'; certificate = 'Certificate'; runtime = 'Runtime'
+    outlook = 'Outlook'; 'windows-update' = 'Windows Update'; certificate = 'Certificate'; runtime = 'Runtime'
     application = 'Application'; eol = 'Windows support'; reboot = 'Restart'
 }
 
@@ -941,6 +1117,17 @@ function ConvertTo-HtmlReport($Report, $Doc) {
     }
     $out.Add('<h2>Runtimes and SQL Server <small>(' + $rows.Count + ')</small></h2>')
     $out.Add((New-HtmlTable @('Software', 'Version', 'Status', 'Latest', 'End of support', 'Path') $rows 'None found, or the check is turned off.'))
+
+    $rows = New-Object Collections.Generic.List[object]
+    foreach ($o in @($Report.outlook)) {
+        $cls = @{ vulnerable = 'bad'; eol = 'bad'; ok = 'good' }[$o.status]
+        $label = @{ vulnerable = 'missing the ' + $o.advisory + ' update'; eol = 'end-of-life'; ok = 'up to date' }[$o.status]
+        if (-not $label) { $label = "$($o.status)" }
+        $rows.Add(@((Format-Html $o.name), (Format-Html $o.version), (Format-Html $o.channel_name), ('<span class="' + $cls + '">' + (Format-Html $label) + '</span>'),
+                    (Format-Html $o.fixed_in), ('<span class="mono">' + (Format-Html $o.path) + '</span>')))
+    }
+    $out.Add('<h2>Classic Outlook <small>(' + $rows.Count + ')</small></h2>')
+    $out.Add((New-HtmlTable @('Outlook', 'Build', 'Channel', 'Status', 'Fixed in', 'Path') $rows 'Not installed, or the check is turned off.'))
 
     $rows = New-Object Collections.Generic.List[object]
     foreach ($a in @($Report.outdated_apps)) {
@@ -1173,6 +1360,19 @@ function Invoke-Main {
             }
         }
 
+        $outlook = @()
+        if ($cfg.include_outlook) {
+            try {
+                $outlook = @(Get-OutlookInstalls | ForEach-Object { Get-OutlookStatus $_ })
+                foreach ($o in $outlook) {
+                    if ($o.status -eq 'vulnerable' -or $o.status -eq 'eol') { $findings.Add((ConvertTo-OutlookFinding $o)) }
+                    elseif ($o.status -eq 'unknown') { $errs.Add("Outlook: cannot read the build of $($o.path) ('$($o.version)')") }
+                    Write-Log "  $($o.name) $($o.version) ($($o.channel_name)): $($o.status)$(if ($o.status -eq 'vulnerable') { ", fixed in $($o.fixed_in)" })"
+                }
+                if (-not $outlook) { Write-Log '  classic Outlook: not installed' }
+            } catch { $errs.Add('Outlook: ' + $_.Exception.Message) }
+        }
+
         $apps = @()
         if ($cfg.include_winget -and $winget) {
             try {
@@ -1210,10 +1410,11 @@ function Invoke-Main {
             agent = "vulnagent-local-scan $VERSION"; generated = $today.ToString('s'); host = $hi.host; system = $hi
             errors = $errs.ToArray(); since_last = $since; patch = $patch; reboot_pending = $reboot; os_support = $osStatus
             missing_updates = @($updates | Select-Object -Property * -ExcludeProperty com)
-            runtimes = $runtimes; outdated_apps = $apps; certificates = $certs; software = $software
+            runtimes = $runtimes; outlook = $outlook; outdated_apps = $apps; certificates = $certs; software = $software
             summary = [ordered]@{ findings = $findings.Count; updates_missing = $updates.Count; security_updates_missing = $secCount
                                   certificates = $certs.Count; certificates_expired = @($certs | Where-Object { $_.status -eq 'expired' }).Count
-                                  certificates_expiring = @($certs | Where-Object { $_.status -eq 'expiring' }).Count }
+                                  certificates_expiring = @($certs | Where-Object { $_.status -eq 'expiring' }).Count
+                                  outlook_vulnerable = @($outlook | Where-Object { $_.status -eq 'vulnerable' -or $_.status -eq 'eol' }).Count }
         }
         if ($Output) { Write-JsonFile $Output $doc; Write-Log "wrote $Output" }
         $page = $null

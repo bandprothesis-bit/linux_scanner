@@ -9,6 +9,7 @@ Every night, as a scheduled task running as SYSTEM, it does this:
 | **Missing security updates** | Windows Update, or the WSUS server the machine already uses | One finding per update, with the KB, CVEs and Microsoft's severity: Critical → Critical, Important → High, Moderate → Medium, unrated → High |
 | **Windows version support** | endoflife.date, by build and edition | High when out of support. Low when support ends within 90 days. |
 | **Runtimes and SQL Server**: .NET, Java (Oracle, Temurin), Python, Node.js, PowerShell 7, SQL Server | Installed programs, compared with endoflife.date | High when end-of-life. Medium when patch releases (or SQL Server CUs) are missing. |
+| **Classic Outlook**: Microsoft 365 Apps, Office 2021/2024, Office LTSC, and Outlook 2010 to 2016 installed from MSI | The Office build and update channel, compared with the builds of the latest Office security release (November 2026). See [Outlook check](#outlook-check). | Critical when the fix for the exploited CVE-2026-124194 is missing. High on Office 2019, and for MSI Outlook, which gets no fixes. |
 | **Outdated applications** such as Chrome, 7-Zip and Notepad++ | `winget upgrade`, only where winget is installed | Low, with the version to update to |
 | **Restart pending** after updates | Registry | Low |
 | **Certificates** in the computer's Personal, Web Hosting and Remote Desktop stores | Certificate store, plus the IIS/HTTP.sys bindings and the Remote Desktop certificate setting to show where each one is used | High when expired or expiring within 7 days. Medium within 30 days. Every other certificate is listed as Info, as an inventory. |
@@ -102,12 +103,37 @@ It contains:
 - The machine, Windows version, last restart and when the scan ran, plus warnings when part of the scan failed or a restart is pending.
 - Counts by severity, missing updates, certificates and Windows support status. Click a severity count to show only those findings.
 - All findings, sorted by severity, with a search box (KB, CVE, name, thumbprint...). Click a finding to see its details: KB, CVEs, path, store, what uses it.
-- Tables of the missing Windows updates, runtimes and SQL Server, applications with updates, and certificates.
+- Tables of the missing Windows updates, runtimes and SQL Server, classic Outlook, applications with updates, and certificates.
 - The updates installed in this run, when patching is on.
 
 Printing it (or *Print → Save as PDF*) expands every finding.
 
 The `C:\ProgramData\vulnagent` folder is readable only by administrators, so a browser can't open the file there directly. Copy it out first (see [Daily operation](#daily-operation)), or write it somewhere else with `-Html <path>` when you run the scan by hand.
+
+## Outlook check
+
+The November 10, 2026 Office security release fixes **CVE-2026-124194**, which attackers already use: opening a crafted file makes Outlook connect to the attacker's server without the usual warning, which hands over the user's NTLMv2 hash. CISA lists it as a known exploited vulnerability. The same release fixes 20 more Outlook CVEs, among them the critical remote code execution bugs CVE-2026-110043, CVE-2026-110068 and CVE-2026-111309.
+
+Windows Update doesn't report these: Microsoft 365 Apps and Office 2021/2024/LTSC update themselves through Click-to-Run. So the scan reads the Office build (`VersionToReport`) and update channel from `HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration` (or the update channel policy) and compares the build with the fixed build of that channel:
+
+| Channel | Fixed in |
+|---|---|
+| Current Channel, Office 2021 and 2024 retail | 16.0.20527.20196 |
+| Monthly Enterprise Channel | 16.0.20527.20194, 16.0.20430.20264 or 16.0.20326.20320, by version |
+| Semi-Annual Enterprise Channel | 16.0.20527.20192, 16.0.20430.20262 or 16.0.20326.20318, by version |
+| Office LTSC 2024 | 16.0.17932.21140 |
+| Office LTSC 2021 | 16.0.14334.21048 |
+| Office 2019 volume licensed | 16.0.10417.20236 (Microsoft doesn't list it as affected by CVE-2026-124194, so High, not Critical) |
+
+The check only runs where `OUTLOOK.EXE` is installed. An Office install without Outlook is skipped.
+
+- **Finding:** *Microsoft Outlook is missing the November 2026 security update (CVE-2026-124194, exploited)*, Critical, with all 21 CVE IDs, so DefectDojo and the report search find it by CVE. When the update is already downloaded and only waits for Office to close, the finding says so.
+- **Outlook 2016, 2013 and 2010 installed from MSI** are out of support and get no fix: *Outlook 2016 is end-of-life...*, High.
+- **The fix:** update Office (in Outlook: *File → Office Account → Update Options → Update Now*, or `"C:\Program Files\Common Files\microsoft shared\ClickToRun\OfficeC2RClient.exe" /update user`, or your Office update tool), then restart Outlook. Until every machine is updated, block outbound SMB (TCP 445) to the internet, which stops the hash from leaving the network.
+- **Not checked:** the new Outlook (`olk.exe`), which isn't affected, and Outlook on the web.
+- **Later releases:** the fixed builds are in the script (`$OutlookAdvisory`). Builds newer than these pass, so the check stays correct, but it doesn't know about later Office security releases until the table is updated.
+
+Turn it off with `"include_outlook": false`.
 
 ## Hardening (Microsoft security baseline)
 
@@ -283,6 +309,7 @@ These checks then show as *Exception* in the report. They are not sent to Defect
 | `windows_update_source` | `default` | `default` uses the machine's own setting: WSUS if configured, otherwise Windows Update. `windows_update` asks Microsoft directly, bypassing WSUS. `microsoft_update` also covers SQL Server and Office, but only on machines where "updates for other Microsoft products" is enabled. |
 | `include_non_security_updates` | `false` | Also report non-security updates, as Info. |
 | `include_runtimes` | `true` | The end-of-life and patch checks for .NET, Java, Python, Node.js, PowerShell and SQL Server. |
+| `include_outlook` | `true` | The [Outlook check](#outlook-check): classic Outlook compared with the latest Office security release. |
 | `include_winget` | `true` | Outdated applications, where winget is installed. |
 | `eol_warning_days` | `90` | Warn this many days before Windows support ends. |
 | `include_certificates` | `true` | The certificate check. |
