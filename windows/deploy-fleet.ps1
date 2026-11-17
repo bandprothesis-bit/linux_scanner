@@ -8,9 +8,9 @@
     WinRM must be enabled on the targets; it is on by default on domain-joined
     Windows Servers.
 
-    For each machine it copies vulnagent-win.ps1, vulnagent-harden.ps1 and
-    install.ps1, runs the installer and starts the first scan and hardening
-    check in the background. The API token is
+    For each machine it copies vulnagent-win.ps1, vulnagent-harden.ps1,
+    vulnagent-ai.ps1 and install.ps1, runs the installer and starts the first
+    scan, hardening check and AI agent scan in the background. The API token is
     asked once (or taken from $env:DD_API_TOKEN) and sent over the encrypted
     WinRM session.
 
@@ -29,11 +29,13 @@ param(
     [pscredential]$Credential,
     [switch]$Insecure,
     [switch]$NoRun,
-    [switch]$NoHardening
+    [switch]$NoHardening,
+    [switch]$NoAiScan
 )
 
 $ErrorActionPreference = 'Stop'
-$files = @((Join-Path $PSScriptRoot 'vulnagent-win.ps1'), (Join-Path $PSScriptRoot 'vulnagent-harden.ps1'), (Join-Path $PSScriptRoot 'install.ps1'))
+$files = @((Join-Path $PSScriptRoot 'vulnagent-win.ps1'), (Join-Path $PSScriptRoot 'vulnagent-harden.ps1'),
+           (Join-Path $PSScriptRoot 'vulnagent-ai.ps1'), (Join-Path $PSScriptRoot 'install.ps1'))
 foreach ($f in $files) { if (-not (Test-Path $f)) { throw "missing ${f}: run this from the windows folder of the repository" } }
 
 $tok = $env:DD_API_TOKEN
@@ -54,14 +56,15 @@ foreach ($c in ($ComputerName | Where-Object { $_.Trim() -and -not $_.Trim().Sta
         $s = New-PSSession @sp
         Invoke-Command -Session $s -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $remoteDir
         Copy-Item -ToSession $s -Path $files -Destination $remoteDir -Force
-        $out = Invoke-Command -Session $s -ArgumentList $remoteDir, $Url, $tok, $ProductType, $At, [bool]$Insecure, [bool]$NoRun, [bool]$NoHardening -ScriptBlock {
-            param($dir, $url, $tok, $ptype, $at, $insecure, $norun, $noharden)
+        $out = Invoke-Command -Session $s -ArgumentList $remoteDir, $Url, $tok, $ProductType, $At, [bool]$Insecure, [bool]$NoRun, [bool]$NoHardening, [bool]$NoAiScan -ScriptBlock {
+            param($dir, $url, $tok, $ptype, $at, $insecure, $norun, $noharden, $noai)
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             $env:DD_API_TOKEN = $tok
             $a = @{ Url = $url; At = $at; NoRun = $true }
             if ($ptype) { $a.ProductType = $ptype }
             if ($insecure) { $a.Insecure = $true }
             if ($noharden) { $a.NoHardening = $true }
+            if ($noai) { $a.NoAiScan = $true }
             try {
                 & (Join-Path $dir 'install.ps1') @a
             } finally {
@@ -71,6 +74,7 @@ foreach ($c in ($ComputerName | Where-Object { $_.Trim() -and -not $_.Trim().Sta
             if (-not $norun) {
                 Start-ScheduledTask -TaskName 'vulnagent'; 'first scan started'
                 if (-not $noharden) { Start-ScheduledTask -TaskName 'vulnagent-hardening'; 'first hardening check started' }
+                if (-not $noai) { Start-ScheduledTask -TaskName 'vulnagent-ai'; 'first AI agent scan started' }
             }
         }
         $out | ForEach-Object { Write-Host "   $_" }

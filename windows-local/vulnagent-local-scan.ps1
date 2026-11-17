@@ -1229,7 +1229,7 @@ function Save-Reports([string]$Kind, $Report, $Doc, [string]$Page, $Cfg, $Counts
         $limit = (Get-Date).AddDays(-$days)
         Get-ChildItem -Path $hist -File | Where-Object { $_.LastWriteTime -lt $limit } | Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    # the scan and the hardening check both rewrite the index; if they collide, the next run fixes it
+    # the scan, the hardening check and the AI agent scan all rewrite the index; if they collide, the next run fixes it
     try { Update-ReportIndex } catch { Write-Log "ERROR report index: $($_.Exception.Message)" }
 }
 
@@ -1246,7 +1246,7 @@ function Update-ReportIndex {
     $out.Add('<h1>Security reports &ndash; ' + (Format-Html $name) + '</h1>')
     $out.Add('<div class="mut">vulnagent-local: these reports stay on this machine, in ' + (Format-Html $dir) + '. Updated ' + (Get-Date).ToString('yyyy-MM-dd HH:mm') + '.</div>')
     $out.Add('<div class="cards">')
-    foreach ($k in @(@('scan', 'Latest scan'), @('hardening', 'Latest hardening check'))) {
+    foreach ($k in @(@('scan', 'Latest scan'), @('hardening', 'Latest hardening check'), @('ai', 'Latest AI agent scan'))) {
         $last = @($runs | Where-Object { $_.kind -eq $k[0] }) | Select-Object -First 1
         if (-not $last -or -not (Test-Path (Join-Path $dir "$($k[0]).html"))) { continue }
         $big = if ($k[0] -eq 'hardening') { "$($last.score)%" } else { [string](@($last.severities.PSObject.Properties | ForEach-Object { [int]$_.Value }) | Measure-Object -Sum).Sum }
@@ -1260,7 +1260,8 @@ function Update-ReportIndex {
         $out.Add('<div class="wrap"><table><thead><tr><th>When</th><th>Report</th><th>Result</th>' +
                  (($SeverityOrder.Keys | ForEach-Object { '<th>' + $_ + '</th>' }) -join '') + '<th>New</th><th>Fixed</th></tr></thead><tbody>')
         foreach ($r in $runs) {
-            $label = if ($r.kind -eq 'hardening') { 'Hardening' } else { 'Scan' }
+            $label = @{ hardening = 'Hardening'; ai = 'AI agents' }["$($r.kind)"]
+            if (-not $label) { $label = 'Scan' }
             if ($r.html -and (Test-Path (Join-Path $dir $r.html))) { $label = '<a href="' + (Format-Html $r.html) + '">' + $label + '</a>' }
             $total = @($r.severities.PSObject.Properties | ForEach-Object { [int]$_.Value }) | Measure-Object -Sum
             $result = if ($r.kind -eq 'hardening') { "$($r.score)% compliant, $($total.Sum) failed" } else { "$($total.Sum) findings" }

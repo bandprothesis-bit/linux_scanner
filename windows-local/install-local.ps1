@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Run from an elevated PowerShell on each Windows machine. It:
-      * copies vulnagent-local-scan.ps1 and vulnagent-local-harden.ps1 to
-        C:\Program Files\vulnagent-local (from this folder, or downloads them
+      * copies vulnagent-local-scan.ps1, vulnagent-local-harden.ps1 and
+        vulnagent-local-ai.ps1 to C:\Program Files\vulnagent-local (from this folder, or downloads them
         from GitHub when run on its own),
       * creates C:\vulnagent-local, readable only by SYSTEM and Administrators
         (the reports list the machine's weaknesses), and writes config.json
@@ -17,11 +17,14 @@
       * creates the "vulnagent-local-hardening" task at the same time: it
         checks the machine against the Microsoft security baseline without
         changing anything (leave it out with -NoHardening),
-      * runs the first scan and hardening check, so the reports exist right
-        away.
+      * creates the "vulnagent-local-ai" task at the same time: it finds the AI
+        agents, local AI servers and MCP servers on the machine and their risks
+        (leave it out with -NoAiScan),
+      * runs the first scan, hardening check and AI agent scan, so the reports
+        exist right away.
 
     Reports: C:\vulnagent-local\reports\index.html links to the
-    latest scan and hardening reports and to every earlier run.
+    latest scan, hardening and AI agent reports and to every earlier run.
 
     Running it again updates the scripts and keeps the existing config.
 
@@ -41,6 +44,7 @@ param(
     [string[]]$ReportReaders,
     [switch]$NoRun,
     [switch]$NoHardening,
+    [switch]$NoAiScan,
     [switch]$Uninstall,
     [switch]$Purge,
     [string]$Source = 'https://raw.githubusercontent.com/bandprothesis-bit/linux_scanner/defectdojo/windows-local/vulnagent-local-scan.ps1'
@@ -49,12 +53,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $TaskName = 'vulnagent-local-scan'
 $HardenTask = 'vulnagent-local-hardening'
+$AiTask = 'vulnagent-local-ai'
 $BinDir = Join-Path $env:ProgramFiles 'vulnagent-local'
 $DataDir = Join-Path "$env:SystemDrive\" 'vulnagent-local'   # C:\vulnagent-local
 $OldDataDir = Join-Path $env:ProgramData 'vulnagent-local'   # used by the first version
 $ReportDir = Join-Path $DataDir 'reports'
 $Agent = Join-Path $BinDir 'vulnagent-local-scan.ps1'
 $Harden = Join-Path $BinDir 'vulnagent-local-harden.ps1'
+$AiScan = Join-Path $BinDir 'vulnagent-local-ai.ps1'
 $Conf = Join-Path $DataDir 'config.json'
 $PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
@@ -66,6 +72,7 @@ if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $HardenTask -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $AiTask -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item $BinDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($Purge) {
         Remove-Item $DataDir, $OldDataDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -103,6 +110,7 @@ function Install-Script([string]$Name, [string]$Target, [string]$Marker) {
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Install-Script 'vulnagent-local-scan.ps1' $Agent 'vulnagent-local scan for Windows'
 if (-not $NoHardening) { Install-Script 'vulnagent-local-harden.ps1' $Harden 'vulnagent-local hardening for Windows' }
+if (-not $NoAiScan) { Install-Script 'vulnagent-local-ai.ps1' $AiScan 'vulnagent-local AI agent scan for Windows' }
 
 # 2. config, then the data folder C:\vulnagent-local
 if ((Test-Path $OldDataDir) -and -not (Test-Path $DataDir)) {
@@ -170,7 +178,21 @@ if ($NoHardening) {
     Write-Host "scheduled task '$HardenTask' runs daily at $At (+ up to 45 min), audit only"
 }
 
-# 4. first scan and hardening check
+if ($NoAiScan) {
+    Unregister-ScheduledTask -TaskName $AiTask -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item $AiScan -Force -ErrorAction SilentlyContinue
+} else {
+    # reads only: files, registry, processes and ports
+    $action = New-ScheduledTaskAction -Execute $PowerShellExe `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$AiScan`""
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 1) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $AiTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+        -Description 'vulnagent-local: find AI agents, local AI servers and MCP servers and their risks, report in C:\vulnagent-local\reports' -Force | Out-Null
+    Write-Host "scheduled task '$AiTask' runs daily at $At (+ up to 45 min)"
+}
+
+# 4. first scan, hardening check and AI agent scan
 if (-not $NoRun) {
     Write-Host ''
     Write-Host 'First scan (the Windows Update search can take several minutes)...'
@@ -186,10 +208,16 @@ if (-not $NoRun) {
         & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $Harden
         if ($LASTEXITCODE -eq 3) { Write-Warning "The hardening check failed. Fix the error above, then run: Start-ScheduledTask $HardenTask" }
     }
+    if (-not $NoAiScan) {
+        Write-Host ''
+        Write-Host 'First AI agent scan...'
+        & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $AiScan
+        if ($LASTEXITCODE -eq 3) { Write-Warning "The AI agent scan failed. Fix the error above, then run: Start-ScheduledTask $AiTask" }
+    }
 }
 Write-Host ''
 Write-Host "Reports: $ReportDir\index.html"
-Write-Host "Logs:    $DataDir\scan.log, $DataDir\hardening.log"
+Write-Host "Logs:    $DataDir\scan.log, $DataDir\hardening.log, $DataDir\ai-agents.log"
 Write-Host "Run now: Start-ScheduledTask $TaskName"
 if (-not $NoHardening) {
     Write-Host "Fix:     & '$Harden' -Apply safe -DryRun   (shows what would change), then without -DryRun"

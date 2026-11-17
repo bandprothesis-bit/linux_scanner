@@ -1,6 +1,6 @@
 # vulnagent-local for Windows: reports on each machine, no server
 
-The same scan and hardening check as [vulnagent for Windows](../windows/README.md), without DefectDojo. Nothing is uploaded and there is no API key: each machine keeps its own reports in `C:\vulnagent-local\reports`.
+The same scan, hardening check and AI agent scan as [vulnagent for Windows](../windows/README.md), without DefectDojo. Nothing is uploaded and there is no API key: each machine keeps its own reports in `C:\vulnagent-local\reports`.
 
 Use it on machines that can't reach DefectDojo, where there is no DefectDojo, or when you only want a report per machine.
 
@@ -8,10 +8,11 @@ Use it on machines that can't reach DefectDojo, where there is no DefectDojo, or
 |---|---|
 | `vulnagent-local-scan.ps1` | Missing Windows security updates, Windows version support, end-of-life or unpatched .NET, Java, Python, Node.js, PowerShell 7 and SQL Server, classic Outlook without the latest Office security release (CVE-2026-124194, exploited), applications winget can upgrade, a pending restart, and expired or expiring certificates. |
 | `vulnagent-local-harden.ps1` | About 130 settings compared with the Microsoft security baseline (Windows Server 2025 Member Server or Domain Controller, Windows 11), plus about 155 to 185 CIS Level 1 checks on Server 2022 and 2025 (and Server 2019 outside a domain), with the matching CIS Benchmark numbers (Stand-alone benchmarks for servers outside a domain, the Defender Antivirus benchmark) and, on Server 2019 and 2022, the DISA STIG IDs. Where IIS or SQL Server is installed, also 24 IIS and 18 SQL Server checks with their DISA STIG IDs. Changes nothing unless you run it with `-Apply`. |
+| `vulnagent-local-ai.ps1` | The AI agents of every user: coding agents (Claude Code, Codex CLI, Gemini CLI, ...), AI editors and extensions (Cursor, Windsurf, GitHub Copilot, Cline, ...), AI apps, local AI servers (Ollama, LM Studio, ...), agent frameworks and MCP servers, with their risks: AI servers open to the network, API keys in plain text in their configs, agents set to run commands without asking, known vulnerabilities, unpinned or unencrypted MCP servers. Only reads. |
 
-The checks, severities and hardening options are exactly those of the DefectDojo version: see [what is checked](../windows/README.md), [Outlook check](../windows/README.md#outlook-check), [hardening](../windows/README.md#hardening-microsoft-security-baseline), [CIS and STIG references](../windows/README.md#cis-benchmark-numbers-and-disa-stig-ids) and [IIS and SQL Server checks](../windows/README.md#iis-and-sql-server-checks) there.
+The checks, severities and hardening options are exactly those of the DefectDojo version: see [what is checked](../windows/README.md), [Outlook check](../windows/README.md#outlook-check), [hardening](../windows/README.md#hardening-microsoft-security-baseline), [CIS and STIG references](../windows/README.md#cis-benchmark-numbers-and-disa-stig-ids) and [IIS and SQL Server checks](../windows/README.md#iis-and-sql-server-checks) and [AI agent scan](../windows/README.md#ai-agent-scan) there.
 
-Needs only Windows PowerShell 5.1 (built into Windows Server 2016 and later; install WMF 5.1 on 2012 R2). The scan connects only to Windows Update or WSUS, `endoflife.date` and winget's sources. The hardening check makes no network connections, except to the local SQL Server instances.
+Needs only Windows PowerShell 5.1 (built into Windows Server 2016 and later; install WMF 5.1 on 2012 R2). The scan connects only to Windows Update or WSUS, `endoflife.date` and winget's sources. The hardening check makes no network connections, except to the local SQL Server instances. The AI agent scan connects only to OSV.dev, with package names and versions.
 
 ## Install on one machine
 
@@ -28,14 +29,15 @@ Without internet access, copy the `windows-local` folder to the machine and run,
 powershell -ExecutionPolicy Bypass -File .\install-local.ps1
 ```
 
-The installer copies the two scripts to `C:\Program Files\vulnagent-local`, keeps the config, reports, logs and hardening backups in `C:\vulnagent-local` (readable only by SYSTEM and Administrators), creates the tasks `vulnagent-local-scan` and `vulnagent-local-hardening` (daily at 03:30 plus up to 45 minutes), and runs the first scan and hardening check, so the reports are there when it finishes.
+The installer copies the three scripts to `C:\Program Files\vulnagent-local`, keeps the config, reports, logs and hardening backups in `C:\vulnagent-local` (readable only by SYSTEM and Administrators), creates the tasks `vulnagent-local-scan`, `vulnagent-local-hardening` and `vulnagent-local-ai` (daily at 03:30 plus up to 45 minutes), and runs the first scan, hardening check and AI agent scan, so the reports are there when it finishes.
 
 | Option | Meaning |
 |---|---|
 | `-At 22:00` | Another time for the nightly run. |
 | `-KeepDays 180` | Keep the dated reports this many days (default 90; `0` keeps all). |
 | `-ReportReaders 'CONTOSO\Server Admins'` | Users or groups that may open the reports without *Run as administrator* (see below). Saved in the config, so a reinstall keeps them; `-ReportReaders none` removes them again. |
-| `-NoHardening` | Only the scan, no hardening check. |
+| `-NoHardening` | No hardening check. |
+| `-NoAiScan` | No AI agent scan. |
 | `-NoRun` | Don't run the first scan now. |
 | `-Uninstall` | Remove the tasks and scripts; the reports are kept. Add `-Purge` to delete them too. |
 
@@ -43,15 +45,16 @@ Running the installer again updates the scripts and keeps the config. It also mo
 
 ## Run without installing
 
-For a one-off check, or to try it first, run the two scripts straight from the extracted folder. Nothing is installed (no scheduled tasks, nothing in `C:\Program Files`). The reports go to the same `C:\vulnagent-local\reports` as after an install; the scripts create the folder the first time, readable only by SYSTEM and Administrators.
+For a one-off check, or to try it first, run the scripts straight from the extracted folder. Nothing is installed (no scheduled tasks, nothing in `C:\Program Files`). The reports go to the same `C:\vulnagent-local\reports` as after an install; the scripts create the folder the first time, readable only by SYSTEM and Administrators.
 
-In **PowerShell as administrator**, in the `windows-local` folder (only `vulnagent-local-scan.ps1` and `vulnagent-local-harden.ps1` are needed):
+In **PowerShell as administrator**, in the `windows-local` folder (only `vulnagent-local-scan.ps1`, `vulnagent-local-harden.ps1` and `vulnagent-local-ai.ps1` are needed):
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force              # allow scripts in this window only
 .\vulnagent-local-scan.ps1 -Html $env:TEMP\scan.html          # 5 to 15 minutes (Windows Update search)
 .\vulnagent-local-harden.ps1 -Html $env:TEMP\hardening.html   # only reads, changes nothing
-ii $env:TEMP\scan.html; ii $env:TEMP\hardening.html
+.\vulnagent-local-ai.ps1 -Html $env:TEMP\ai.html                # AI agents, about a minute
+ii $env:TEMP\scan.html; ii $env:TEMP\hardening.html; ii $env:TEMP\ai.html
 ```
 
 `-Html` writes an extra copy that a normal browser can open, since the reports folder is for administrators only.
@@ -77,7 +80,7 @@ From an admin workstation, in the `windows-local` folder, as a user who is admin
 .\deploy-fleet-local.ps1 -ComputerName srv01, srv02 -ReportReaders 'CONTOSO\Server Admins' -Credential (Get-Credential)
 ```
 
-It installs on each machine and starts the first scan in the background. The reports stay on each machine.
+It installs on each machine and starts the first scan, hardening check and AI agent scan in the background. The reports stay on each machine. `-At`, `-KeepDays`, `-NoHardening` and `-NoAiScan` work as in the installer.
 
 ## The reports
 
@@ -85,15 +88,15 @@ Everything is in `C:\vulnagent-local\reports`:
 
 | File | Content |
 |---|---|
-| `index.html` | **Start here.** The latest scan and hardening result, and a table of every earlier run with its counts by severity and what was new or fixed. |
-| `scan.html`, `hardening.html` | The latest reports. Click a finding or check for details; the severity cards filter the list. |
-| `scan.json`, `hardening.json` | All data of the latest run, for scripts. |
-| `scan-findings.json`, `hardening-findings.json` | The findings only, in DefectDojo's *Generic Findings Import* format, so you can still import a report into DefectDojo by hand. |
-| `history\<date>-<time>-scan.html` (and `-hardening`) | A copy of each run's report, deleted after `keep_reports_days`. |
+| `index.html` | **Start here.** The latest scan, hardening and AI agent result, and a table of every earlier run with its counts by severity and what was new or fixed. |
+| `scan.html`, `hardening.html`, `ai.html` | The latest reports. Click a finding or check for details; the severity cards filter the list. |
+| `scan.json`, `hardening.json`, `ai.json` | All data of the latest run, for scripts. |
+| `scan-findings.json`, `hardening-findings.json`, `ai-findings.json` | The findings only, in DefectDojo's *Generic Findings Import* format, so you can still import a report into DefectDojo by hand. |
+| `history\<date>-<time>-scan.html` (and `-hardening`, `-ai`) | A copy of each run's report, deleted after `keep_reports_days`. |
 
 **What changed since the last run:** every report starts with a box that lists the new findings and the fixed ones (for hardening: checks that fail now but passed before, and checks that pass now). When part of a run failed, for example the Windows Update search, findings it couldn't check are listed as *gone*, not *fixed*. The ERROR lines in the report say what failed.
 
-Logs: `C:\vulnagent-local\scan.log` and `hardening.log`.
+Logs: `C:\vulnagent-local\scan.log`, `hardening.log` and `ai-agents.log`.
 
 ### Opening the reports
 
@@ -119,6 +122,7 @@ In an administrator PowerShell:
 ```powershell
 Start-ScheduledTask vulnagent-local-scan           # scan now, as SYSTEM, like at night
 Start-ScheduledTask vulnagent-local-hardening      # hardening check now
+Start-ScheduledTask vulnagent-local-ai             # AI agent scan now
 
 $s = "C:\Program Files\vulnagent-local"
 & "$s\vulnagent-local-scan.ps1" -InstallUpdates security    # install missing security updates, then scan (never restarts)
@@ -158,6 +162,12 @@ Exit codes, for both scripts: `0` done, `2` part of the run failed (the report m
 | `cis_checks` | `true` | Also check the CIS Level 1 settings outside the Microsoft baseline (`CIS-001` and up, see [CIS Level 1 checks](../windows/README.md#cis-level-1-checks)). |
 | `iis_checks` | `true` | Check the IIS settings (`IIS-01` and up), where IIS is installed. |
 | `sql_checks` | `true` | Check the SQL Server settings (`SQL-01` and up), where SQL Server is installed. The checks connect to the local instances as SYSTEM. |
+| `ai_inventory` | `true` | Also list every AI agent and MCP server found, as Info. |
+| `ai_osv` | `true` | Look up known vulnerabilities of the AI agents on OSV.dev. Set to `false` on machines without internet access. |
+| `ai_allowed` | `[]` | Approved AI agents (names as in the report, wildcards allowed). When set, every other agent is reported. |
+| `ai_blocked` | `[]` | AI agents that are not allowed: reported as High. |
+| `ai_unapproved_severity` | `Medium` | Severity of an agent that isn't in `ai_allowed`. |
+| `ai_ignore` | `[]` | AI agent findings to leave out: agent names, finding IDs such as `ai-mcp-unpinned`, or unique IDs. |
 
 ## Troubleshooting
 
@@ -167,5 +177,5 @@ The Windows Update, end-of-life, winget and hardening messages are the same as i
 |---|---|
 | The browser says the file can't be opened, or access denied | The reports folder is for administrators only. See [Opening the reports](#opening-the-reports). |
 | `running scripts is disabled on this system`, or `is not digitally signed` | Run `Set-ExecutionPolicy -Scope Process Bypass -Force` in that window first. If a Group Policy sets the execution policy, this is ignored: sign the scripts or ask for an exception. |
-| `ERROR report index` in the log | The scan and the hardening check wrote `index.html` at the same moment. The next run fixes it; the reports themselves are complete. |
+| `ERROR report index` in the log | Two of the scripts wrote `index.html` at the same moment. The next run fixes it; the reports themselves are complete. |
 | `index.html` shows fewer runs than expected | Older reports were deleted after `keep_reports_days`. |

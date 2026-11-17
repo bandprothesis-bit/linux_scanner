@@ -9,8 +9,9 @@
     Windows Servers.
 
     For each machine it copies vulnagent-local-scan.ps1,
-    vulnagent-local-harden.ps1 and install-local.ps1, runs the installer and
-    starts the first scan and hardening check in the background. The reports
+    vulnagent-local-harden.ps1, vulnagent-local-ai.ps1 and install-local.ps1,
+    runs the installer and starts the first scan, hardening check and AI agent
+    scan in the background. The reports
     stay on each machine, in C:\vulnagent-local\reports.
 
 .EXAMPLE
@@ -27,11 +28,13 @@ param(
     [string[]]$ReportReaders,
     [pscredential]$Credential,
     [switch]$NoRun,
-    [switch]$NoHardening
+    [switch]$NoHardening,
+    [switch]$NoAiScan
 )
 
 $ErrorActionPreference = 'Stop'
-$files = @((Join-Path $PSScriptRoot 'vulnagent-local-scan.ps1'), (Join-Path $PSScriptRoot 'vulnagent-local-harden.ps1'), (Join-Path $PSScriptRoot 'install-local.ps1'))
+$files = @((Join-Path $PSScriptRoot 'vulnagent-local-scan.ps1'), (Join-Path $PSScriptRoot 'vulnagent-local-harden.ps1'),
+           (Join-Path $PSScriptRoot 'vulnagent-local-ai.ps1'), (Join-Path $PSScriptRoot 'install-local.ps1'))
 foreach ($f in $files) { if (-not (Test-Path $f)) { throw "missing ${f}: run this from the windows-local folder of the repository" } }
 
 $remoteDir = 'C:\Windows\Temp\vulnagent-local-setup'
@@ -47,12 +50,13 @@ foreach ($c in ($ComputerName | Where-Object { $_.Trim() -and -not $_.Trim().Sta
         $s = New-PSSession @sp
         Invoke-Command -Session $s -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $remoteDir
         Copy-Item -ToSession $s -Path $files -Destination $remoteDir -Force
-        $out = Invoke-Command -Session $s -ArgumentList $remoteDir, $At, $KeepDays, $ReportReaders, [bool]$NoRun, [bool]$NoHardening -ScriptBlock {
-            param($dir, $at, $keep, $readers, $norun, $noharden)
+        $out = Invoke-Command -Session $s -ArgumentList $remoteDir, $At, $KeepDays, $ReportReaders, [bool]$NoRun, [bool]$NoHardening, [bool]$NoAiScan -ScriptBlock {
+            param($dir, $at, $keep, $readers, $norun, $noharden, $noai)
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             $a = @{ At = $at; KeepDays = $keep; NoRun = $true }
             if ($readers) { $a.ReportReaders = $readers }
             if ($noharden) { $a.NoHardening = $true }
+            if ($noai) { $a.NoAiScan = $true }
             try {
                 & (Join-Path $dir 'install-local.ps1') @a
             } finally {
@@ -62,6 +66,7 @@ foreach ($c in ($ComputerName | Where-Object { $_.Trim() -and -not $_.Trim().Sta
             if (-not $norun) {
                 Start-ScheduledTask -TaskName 'vulnagent-local-scan'; 'first scan started'
                 if (-not $noharden) { Start-ScheduledTask -TaskName 'vulnagent-local-hardening'; 'first hardening check started' }
+                if (-not $noai) { Start-ScheduledTask -TaskName 'vulnagent-local-ai'; 'first AI agent scan started' }
             }
         }
         $out | ForEach-Object { Write-Host "   $_" }

@@ -18,6 +18,8 @@ Each run also writes a readable **HTML report** of everything it found: see [HTM
 
 A second script, **vulnagent-harden.ps1**, compares each machine with the **Microsoft security baseline** and reports every deviation to DefectDojo. It can also apply the recommended settings, with a backup and undo. See [Hardening](#hardening-microsoft-security-baseline).
 
+A third script, **vulnagent-ai.ps1**, finds the **AI agents** on each machine (coding agents, AI editors and extensions, local AI servers such as Ollama, MCP servers) and their risks: servers open to the network, API keys in plain text, agents set to run commands without asking, known vulnerabilities. See [AI agent scan](#ai-agent-scan).
+
 Without DefectDojo, use [vulnagent-local](../windows-local/README.md): the same checks, with the reports kept on each machine.
 
 Each machine becomes its own DefectDojo product under the product type **Windows servers**. Fixed findings close automatically, new ones are added, and notes and risk acceptances are kept, the same as on Linux.
@@ -44,10 +46,10 @@ $env:DD_API_TOKEN = '<your-api-key>'; powershell -ExecutionPolicy Bypass -File .
 
 The installer does four things:
 
-1. Copies the agent and the hardening script to `C:\Program Files\vulnagent\`.
+1. Copies the agent, the hardening script and the AI agent scan to `C:\Program Files\vulnagent\`.
 2. Writes `C:\ProgramData\vulnagent\defectdojo.json`. Only SYSTEM and Administrators can read that folder, because the file holds the key.
-3. Creates the scheduled task **vulnagent**, which runs daily at 03:30 plus up to 45 minutes of random delay, and the task **vulnagent-hardening** at the same time. The hardening task only checks and reports; it changes nothing.
-4. Runs the first scan and the first hardening check. The scan takes 2–10 minutes, mostly the Windows Update search. Then the server appears in DefectDojo under **Products**.
+3. Creates the scheduled task **vulnagent**, which runs daily at 03:30 plus up to 45 minutes of random delay, and the tasks **vulnagent-hardening** and **vulnagent-ai** at the same time. Both only check and report; they change nothing.
+4. Runs the first scan, hardening check and AI agent scan. The scan takes 2–10 minutes, mostly the Windows Update search. Then the server appears in DefectDojo under **Products**.
 
 Installer options:
 
@@ -59,6 +61,7 @@ Installer options:
 | `-Insecure` | Accept a self-signed HTTPS certificate on DefectDojo. Better: import your internal CA into the server's *Trusted Root Certification Authorities*. |
 | `-NoRun` | Don't run the first scan now. |
 | `-NoHardening` | Don't install the hardening script and task (removes them if they were installed before). |
+| `-NoAiScan` | Don't install the AI agent scan and its task (removes them if they were installed before). |
 | `-Uninstall` (`-Purge`) | Remove the task and agent. Add `-Purge` to also delete the config and reports. |
 
 Running the installer again updates the agent and keeps the config.
@@ -71,7 +74,7 @@ From an admin workstation, run this in the `windows` folder as a user who is adm
 .\deploy-fleet.ps1 -ComputerName (Get-Content .\servers.txt) -Url http://<dojo-server>:8080
 ```
 
-`servers.txt` holds one server name per line. The script asks for the API key once, installs on each server, starts each first scan in the background, and prints a table of the results. Add `-Credential (Get-Credential)` to connect as a different account.
+`servers.txt` holds one server name per line. The script asks for the API key once, installs on each server, starts each first scan in the background, and prints a table of the results. Add `-Credential (Get-Credential)` to connect as a different account. `-At`, `-NoHardening` and `-NoAiScan` work as in the installer.
 
 With **Group Policy** instead: put the `windows` folder on a share that the computer accounts can read, and add a computer startup script that runs `install.ps1 -Url ... -NoRun`, with the key in `$env:DD_API_TOKEN`. Keep in mind that the key is then readable from the share.
 
@@ -93,6 +96,9 @@ With **Group Policy** instead: put the `windows` folder on a share that the comp
 | Hardening report without uploading | `... vulnagent-harden.ps1 -DryRun -Html $env:TEMP\hardening.html; start $env:TEMP\hardening.html` |
 | Hardening: apply the safe settings | `... vulnagent-harden.ps1 -Apply safe` (see [Hardening](#hardening-microsoft-security-baseline)) |
 | Hardening log | `Get-Content C:\ProgramData\vulnagent\hardening.log -Tail 30` |
+| AI agent scan and upload now | `Start-ScheduledTask vulnagent-ai` |
+| AI agent report without uploading | `... vulnagent-ai.ps1 -DryRun -Html $env:TEMP\ai-agents.html; start $env:TEMP\ai-agents.html` |
+| AI agent scan log | `Get-Content C:\ProgramData\vulnagent\ai-agents.log -Tail 30` |
 
 ## HTML report
 
@@ -134,6 +140,47 @@ The check only runs where `OUTLOOK.EXE` is installed. An Office install without 
 - **Later releases:** the fixed builds are in the script (`$OutlookAdvisory`). Builds newer than these pass, so the check stays correct, but it doesn't know about later Office security releases until the table is updated.
 
 Turn it off with `"include_outlook": false`.
+
+## AI agent scan
+
+A third script, **vulnagent-ai.ps1** (task **vulnagent-ai**), finds the AI agents on each machine: what is installed for each user, what is running, and the risks they bring. It reports to the same DefectDojo product, in the engagement **ai-agents**, and writes `C:\ProgramData\vulnagent\reports\ai-agents.html`.
+
+It looks in every user profile and machine-wide for:
+
+| Kind | Examples | Found from |
+|---|---|---|
+| AI coding agents | Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Qwen Code, OpenCode, Amp, Augment, Aider, Open Interpreter, OpenHands, Goose | Global npm packages (npm, pnpm, bun), the Claude Code native install, Python packages |
+| AI code editors | Cursor, Windsurf, Kiro, Trae | Program folders, the list of installed programs |
+| Editor extensions | GitHub Copilot, Cline, Roo Code, Kilo Code, Continue, Amazon Q, Gemini Code Assist, Tabnine, the Claude Code and Codex extensions | The extension folders of VS Code, VS Code Insiders, VSCodium, Cursor, Windsurf, Kiro and Trae |
+| AI assistant apps | Claude, ChatGPT, Microsoft Copilot, Perplexity | Program folders, Store apps |
+| Local AI servers | Ollama, LM Studio, Jan, GPT4All, AnythingLLM, Msty, llama.cpp, KoboldCpp, LocalAI, Open WebUI, vLLM, LiteLLM | Program folders, Python packages, running processes, open ports, Windows services |
+| Agent frameworks (Python) | LangChain, LangGraph, CrewAI, AutoGen, LlamaIndex, Semantic Kernel, smolagents, OpenAI Agents SDK, Browser Use, Letta | Python in the user profile and in Program Files, pipx, uv tools, Anaconda and Miniconda |
+| MCP servers | Every server configured for Claude Code, the Claude app, Cursor, Windsurf, VS Code and its forks, Cline, Roo Code, Kilo Code, Gemini CLI, Codex CLI, Copilot CLI and OpenCode | Their config files |
+
+Findings:
+
+| Finding | Severity |
+|---|---|
+| *Ollama API reachable from the network on port 11434*: a local AI server listening on an address other machines can reach (`0.0.0.0`, `::` or a network address). Local AI servers have no login by default. Also llama.cpp, LM Studio with *Serve on Local Network*, and the others in the list. | High |
+| *Ollama is set to listen on the network (OLLAMA_HOST=0.0.0.0)*, when Ollama isn't running at the time of the scan | High |
+| *Secret in plain text in the ... config*: an API key or token written in an agent or MCP config. Known formats (Anthropic, OpenAI, GitHub, GitLab, Slack, AWS, Google, Hugging Face, Stripe, bearer tokens, private keys) are High; other values of keys named like a secret (`apiKey`, `PASSWORD`, `token`) are Medium. | High, Medium |
+| *... runs without asking*: Claude Code `permissions.defaultMode` `bypassPermissions` (High when set in the managed settings for everyone), Codex `approval_policy = "never"` together with `sandbox_mode = "danger-full-access"` (High; one of them alone is Medium), Gemini CLI `defaultApprovalMode` `yolo`, VS Code agent mode `chat.tools.autoApprove`, Aider `yes-always` | High, Medium |
+| *... has N known vulnerabilities*: the installed version compared with OSV.dev (npm and Python packages, Claude Code, Ollama), with the version that fixes them | From the advisory |
+| *Ollama runs as a Windows service under LocalSystem* (any local AI server installed as a service running as SYSTEM) | Medium |
+| *Ollama accepts requests from any website* (`OLLAMA_ORIGINS=*`): any web page the user opens can use the local API | Medium |
+| *MCP server ... uses unencrypted HTTP*: an `http://` address that isn't on this machine | Medium |
+| *MCP server ... runs an unpinned package*: `npx -y <package>` or `uvx <package>` without a version, so each start downloads the latest release | Low |
+| *AI agent not on the approved list* (with `ai_allowed`) or *Blocked AI agent installed* (with `ai_blocked`) | Medium (`ai_unapproved_severity`), High |
+| *AI agent installed* and *MCP server configured*: the inventory | Info |
+
+- **It only reads.** It runs nothing it finds (a program in a user's profile is never started as SYSTEM) and changes nothing. The only network access is to OSV.dev, with package names and versions. Secrets never leave the machine: the findings and reports show only their first characters and length.
+- **A policy for the fleet.** List the approved tools in `ai_allowed`, by the names the report uses, with wildcards: `"ai_allowed": ["GitHub Copilot", "Claude*", "Microsoft Copilot"]`. Every other agent is then reported as *not on the approved list*. `ai_blocked` reports the named ones as High.
+- **Fewer findings.** `"ai_inventory": false` leaves out the Info findings. `ai_ignore` leaves out findings by agent name, finding ID (for example `ai-mcp-unpinned`) or unique ID.
+- **Claude Code managed settings.** When `C:\Program Files\ClaudeCode\managed-settings.json` sets `permissions.disableBypassPermissionsMode` to `"disable"`, bypass mode can't be used, so the users' `bypassPermissions` settings aren't reported.
+- **Not covered.** Project folders aren't searched: an MCP config (`.mcp.json`, `.vscode\mcp.json`) or a Python virtual environment inside a project isn't found, only the user's own configs and global installs. Environment variables (`OLLAMA_HOST`) and per-user entries in the list of installed programs can only be read for users who are logged on. Docker containers aren't inspected, except that a container publishing Ollama's port 11434 is reported. Sign-in tokens the tools keep themselves (for example `.codex\auth.json`) aren't reported, because they are expected there.
+- **Reachable from the network** means listening on all or on network addresses. The Windows firewall may still block the port: the finding says so, and the fix is the same either way.
+
+Report without uploading: `powershell -ExecutionPolicy Bypass -File "C:\Program Files\vulnagent\vulnagent-ai.ps1" -DryRun -Html $env:TEMP\ai-agents.html; start $env:TEMP\ai-agents.html`
 
 ## Hardening (Microsoft security baseline)
 
@@ -328,6 +375,13 @@ These checks then show as *Exception* in the report. They are not sent to Defect
 | `cis_checks` | `true` | Also check the CIS Level 1 settings outside the Microsoft baseline (`CIS-001` and up). |
 | `iis_checks` | `true` | Check the IIS settings (`IIS-01` and up), where IIS is installed. |
 | `sql_checks` | `true` | Check the SQL Server settings (`SQL-01` and up), where SQL Server is installed. |
+| `ai_engagement`, `ai_test_title` | `ai-agents` | Where the AI agent findings go in each product. |
+| `ai_inventory` | `true` | Also send every AI agent and MCP server found, as Info. |
+| `ai_osv` | `true` | Look up known vulnerabilities of the AI agents on OSV.dev. Set to `false` on machines without internet access. |
+| `ai_allowed` | `[]` | Approved AI agents (names as in the report, wildcards allowed). When set, every other agent is reported. |
+| `ai_blocked` | `[]` | AI agents that are not allowed: reported as High. |
+| `ai_unapproved_severity` | `Medium` | Severity of an agent that isn't in `ai_allowed`. |
+| `ai_ignore` | `[]` | AI agent findings to leave out: agent names, finding IDs such as `ai-mcp-unpinned`, or unique IDs (wildcards allowed). |
 
 ## Patching
 
@@ -364,6 +418,8 @@ On servers that WSUS or another patch tool already manages, leave it at `none` a
 | `DefectDojo returned HTTP 401` | Wrong API key in the config. |
 | `cannot reach DefectDojo` | Firewall: the server needs TCP 8080 (or 8443) to the DefectDojo server. |
 | `winget upgrade failed` | winget can't open its source as SYSTEM, which is common on Windows Server 2019. Set `include_winget` to `false`. |
+| `ai-agents.log`: `OSV.dev: ...` | No internet access to `api.osv.dev`. The rest of the AI agent scan is complete; set `ai_osv` to `false` on machines that are always offline. |
+| `ai-agents.log`: `<tool> config <file>: cannot read` | That config file isn't valid JSON (the tool would fail to read it too). The other configs are still checked. |
 | `hardening.log`: `X still fails after the change (a Group Policy may set it back)` | A domain GPO sets this setting to another value. Change it in the GPO, or add the check to `hardening_exclude`. |
 | `hardening.log`: `the audit policy could not be read` | `auditpol.exe` failed. Run the script as administrator or SYSTEM. |
 | Defender checks missing from the hardening report | Defender is not the active antivirus (passive mode, or another antivirus). Check `DEF-01`. |
