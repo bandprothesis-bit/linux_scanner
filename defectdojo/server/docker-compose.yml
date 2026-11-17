@@ -1,0 +1,161 @@
+# DefectDojo for vulnagent: a production setup of DefectDojo's own Docker Compose file.
+#
+# Differences from upstream's docker-compose.yml (which is meant for evaluation):
+#   * pinned image versions (DD_VERSION in .env), pulled from Docker Hub
+#   * no default secrets: setup.sh writes random ones to .env, and Compose refuses
+#     to start without them
+#   * HTTPS on 8443 with the certificate in ./certs (setup.sh creates one, or use
+#     your own); 8080 redirects to it. DD_HTTPS=false serves plain HTTP on 8080.
+#   * health checks for PostgreSQL and Valkey, restart after reboot, log rotation
+#
+# Run ./setup.sh the first time. Afterwards: docker compose up -d / down / logs.
+---
+name: defectdojo
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-django-env: &django-env
+  DD_DEBUG: "False"
+  DD_DATABASE_URL: "postgresql://defectdojo:${DD_DATABASE_PASSWORD:?run setup.sh first: .env is missing DD_DATABASE_PASSWORD}@postgres:5432/defectdojo"
+  DD_CELERY_BROKER_URL: "redis://valkey:6379/0"
+  DD_CACHE_URL: "redis://valkey:6379/1"
+  DD_SECRET_KEY: "${DD_SECRET_KEY:?run setup.sh first: .env is missing DD_SECRET_KEY}"
+  DD_CREDENTIAL_AES_256_KEY: "${DD_CREDENTIAL_AES_256_KEY:?run setup.sh first: .env is missing DD_CREDENTIAL_AES_256_KEY}"
+  DD_DATABASE_READINESS_TIMEOUT: "60"
+  DD_ALLOWED_HOSTS: "${DD_ALLOWED_HOSTS:-*}"
+  DD_SITE_URL: "${DD_SITE_URL:-http://localhost:8080}"
+  DD_CSRF_TRUSTED_ORIGINS: "${DD_CSRF_TRUSTED_ORIGINS:-[]}"
+  DD_SESSION_COOKIE_SECURE: "${DD_SECURE_COOKIES:-True}"
+  DD_CSRF_COOKIE_SECURE: "${DD_SECURE_COOKIES:-True}"
+
+x-django: &django
+  image: "${DD_IMAGE_REGISTRY:-docker.io}/defectdojo/defectdojo-django:${DD_VERSION:?.env is missing DD_VERSION}"
+  restart: unless-stopped
+  logging: *logging
+  depends_on:
+    initializer:
+      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
+    valkey:
+      condition: service_healthy
+  environment: *django-env
+  volumes:
+    - type: bind
+      source: ./extra_settings
+      target: /app/docker/extra_settings
+      read_only: true
+
+services:
+  nginx:
+    image: "${DD_IMAGE_REGISTRY:-docker.io}/defectdojo/defectdojo-nginx:${DD_VERSION:?.env is missing DD_VERSION}"
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      uwsgi:
+        condition: service_started
+    environment:
+      USE_TLS: "${DD_HTTPS:-true}"
+      GENERATE_TLS_CERTIFICATE: "false"
+      NGINX_METRICS_ENABLED: "false"
+      DD_UWSGI_HOST: "uwsgi"
+      DD_UWSGI_PORT: "3031"
+    volumes:
+      - media:/usr/share/nginx/html/media
+      - type: bind
+        source: ./certs
+        target: /etc/nginx/ssl
+        read_only: true
+    ports:
+      - "${DD_BIND_ADDRESS:-0.0.0.0}:${DD_PORT:-8080}:8080"
+      - "${DD_BIND_ADDRESS:-0.0.0.0}:${DD_TLS_PORT:-8443}:8443"
+
+  uwsgi:
+    <<: *django
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '60', '--', '/entrypoint-uwsgi.sh']
+    environment:
+      <<: *django-env
+      DD_DJANGO_METRICS_ENABLED: "False"
+    volumes:
+      - type: bind
+        source: ./extra_settings
+        target: /app/docker/extra_settings
+        read_only: true
+      - media:/app/media
+
+  celerybeat:
+    <<: *django
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '60', '--', '/entrypoint-celery-beat.sh']
+
+  celeryworker:
+    <<: *django
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '60', '--', '/entrypoint-celery-worker.sh']
+    volumes:
+      - type: bind
+        source: ./extra_settings
+        target: /app/docker/extra_settings
+        read_only: true
+      - media:/app/media
+
+  # Runs at every start: applies database migrations (also after an upgrade), and on the
+  # very first start creates the admin user with DD_ADMIN_PASSWORD. Then it exits.
+  initializer:
+    image: "${DD_IMAGE_REGISTRY:-docker.io}/defectdojo/defectdojo-django:${DD_VERSION:?.env is missing DD_VERSION}"
+    restart: "no"
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '--', '/entrypoint-initializer.sh']
+    environment:
+      <<: *django-env
+      DD_INITIALIZE: "true"
+      DD_ADMIN_USER: "${DD_ADMIN_USER:-admin}"
+      DD_ADMIN_MAIL: "${DD_ADMIN_MAIL:-admin@defectdojo.local}"
+      DD_ADMIN_FIRST_NAME: "Admin"
+      DD_ADMIN_LAST_NAME: "User"
+      DD_ADMIN_PASSWORD: "${DD_ADMIN_PASSWORD:?run setup.sh first: .env is missing DD_ADMIN_PASSWORD}"
+    volumes:
+      - type: bind
+        source: ./extra_settings
+        target: /app/docker/extra_settings
+        read_only: true
+
+  # same images and digests as DefectDojo 3.5.200's docker-compose.yml
+  postgres:
+    image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: defectdojo
+      POSTGRES_USER: defectdojo
+      POSTGRES_PASSWORD: "${DD_DATABASE_PASSWORD:?run setup.sh first: .env is missing DD_DATABASE_PASSWORD}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U defectdojo -d defectdojo"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  valkey:
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+    restart: unless-stopped
+    logging: *logging
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres_data: {}
+  media: {}
+  valkey_data: {}

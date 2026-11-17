@@ -28,20 +28,20 @@ Defender antivirus signature updates are ignored. Non-security updates are left 
 
 ## Install on one server
 
-You need the DefectDojo address and an API v2 key, the same ones the Linux machines use.
+You need the DefectDojo address and an API v2 key, the same ones the Linux machines use. With the server from [defectdojo/server](../defectdojo/server/README.md), that is `https://<dojo-server>:8443` and the key `setup.sh` printed for the user `vulnagent`. Trust its CA on the machine first, or the upload fails with a certificate error: `Import-Certificate -FilePath .\defectdojo-ca.crt -CertStoreLocation Cert:\LocalMachine\Root` (for many machines, use Group Policy; see [Connect the agents](../defectdojo/server/README.md#connect-the-agents)).
 
 Open **PowerShell as administrator** on the server and run these three lines, with your key and address:
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 $env:DD_API_TOKEN = '<your-api-key>'
-iwr https://raw.githubusercontent.com/bandprothesis-bit/linux_scanner/defectdojo/windows/install.ps1 -UseBasicParsing -OutFile $env:TEMP\vulnagent-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\vulnagent-install.ps1 -Url http://<dojo-server>:8080
+iwr https://raw.githubusercontent.com/bandprothesis-bit/linux_scanner/defectdojo/windows/install.ps1 -UseBasicParsing -OutFile $env:TEMP\vulnagent-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\vulnagent-install.ps1 -Url https://<dojo-server>:8443
 ```
 
 If the server has no internet access, copy the `windows` folder to it (for example over a file share), then run this in that folder:
 
 ```powershell
-$env:DD_API_TOKEN = '<your-api-key>'; powershell -ExecutionPolicy Bypass -File .\install.ps1 -Url http://<dojo-server>:8080
+$env:DD_API_TOKEN = '<your-api-key>'; powershell -ExecutionPolicy Bypass -File .\install.ps1 -Url https://<dojo-server>:8443
 ```
 
 The installer does four things:
@@ -71,7 +71,7 @@ Running the installer again updates the agent and keeps the config.
 From an admin workstation, run this in the `windows` folder as a user who is administrator on the servers. WinRM must be on, which it is by default on domain-joined servers.
 
 ```powershell
-.\deploy-fleet.ps1 -ComputerName (Get-Content .\servers.txt) -Url http://<dojo-server>:8080
+.\deploy-fleet.ps1 -ComputerName (Get-Content .\servers.txt) -Url https://<dojo-server>:8443
 ```
 
 `servers.txt` holds one server name per line. The script asks for the API key once, installs on each server, starts each first scan in the background, and prints a table of the results. Add `-Credential (Get-Credential)` to connect as a different account. `-At`, `-NoHardening` and `-NoAiScan` work as in the installer.
@@ -416,7 +416,7 @@ On servers that WSUS or another patch tool already manages, leave it at `none` a
 | `Windows Update: 0x80248014` | `microsoft_update` is set, but Microsoft Update isn't enabled on this machine. Use `default`. |
 | `cannot download end-of-life data` | No internet access to `endoflife.date`. The last download is reused for 30 days. For servers that are always offline, set `include_runtimes` to `false`. |
 | `DefectDojo returned HTTP 401` | Wrong API key in the config. |
-| `cannot reach DefectDojo` | Firewall: the server needs TCP 8080 (or 8443) to the DefectDojo server. |
+| `cannot reach DefectDojo` | Firewall: the server needs TCP 8443 (or the port in your URL) to the DefectDojo server. |
 | `winget upgrade failed` | winget can't open its source as SYSTEM, which is common on Windows Server 2019. Set `include_winget` to `false`. |
 | `ai-agents.log`: `OSV.dev: ...` | No internet access to `api.osv.dev`. The rest of the AI agent scan is complete; set `ai_osv` to `false` on machines that are always offline. |
 | `ai-agents.log`: `<tool> config <file>: cannot read` | That config file isn't valid JSON (the tool would fail to read it too). The other configs are still checked. |

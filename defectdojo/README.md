@@ -31,42 +31,15 @@ Customers with **Microsoft Defender for Endpoint** can feed the same DefectDojo 
 
 ## 1. DefectDojo server (one VM)
 
-**Recommended VM:** Ubuntu Server 24.04 LTS (Debian 12/13 also works), 4 vCPU, 8 GB RAM, 50 GB disk. Give it a fixed IP address or a DNS name that the machines can reach.
-
-Install Docker:
+[server/](server/README.md) has a ready-to-run DefectDojo: pinned version, random secrets, HTTPS with its own CA, backups, and an API user for the agents. Copy the `server` folder to a Linux VM (Ubuntu Server 24.04 LTS or Debian 13; 4 vCPU, 8 GB RAM, 50 GB disk), then:
 
 ```bash
-sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
+cd /opt/defectdojo && sudo ./setup.sh --install-docker --host <dns-name-or-ip>
 ```
 
-Download and start DefectDojo:
+After 5 to 10 minutes it prints the address (`https://<host>:8443`), the admin password, the API key for the agents (user `vulnagent`, global role Maintainer) and the CA certificate the agents must trust. Details, backups and upgrades: [server/README.md](server/README.md).
 
-```bash
-git clone https://github.com/DefectDojo/django-DefectDojo.git ~/django-DefectDojo
-```
-
-```bash
-cd ~/django-DefectDojo && sudo docker compose up -d
-```
-
-The first start downloads the images and initialises the database, which takes 3–5 minutes. When it finishes, get the generated admin password:
-
-```bash
-sudo docker compose logs initializer | grep "Admin password:"
-```
-
-Open `http://<vm-ip>:8080` and log in as `admin`. HTTPS is on port `8443` with a self-signed certificate. For production, put a real certificate in front of it (see DefectDojo's `readme-docs/DOCKER.md`).
-
-The containers restart automatically after a reboot.
-
-**API token:** for testing, log in as admin and open the user menu (top right) → **API v2 Key**.
-
-For production, create a dedicated user for the machines instead:
-
-1. Go to **Users → Add user**, name it `vulnagent`, and give it the global role **Maintainer**, which lets it create a product per machine.
-2. Log in as that user and copy its **API v2 Key**.
-
-**Firewall:** the machines need to reach the VM on TCP 8080 (or 8443).
+**Firewall:** the machines need to reach the VM on TCP 8443.
 
 ## 2. Each Linux machine
 
@@ -77,7 +50,7 @@ cd ~/linux_scanner && git pull && git checkout defectdojo
 ```
 
 ```bash
-sudo DD_API_TOKEN=<your-token> sh defectdojo/install.sh --url http://<vm-ip>:8080
+sudo DD_API_TOKEN=<your-token> sh defectdojo/install.sh --url https://<vm-ip>:8443
 ```
 
 This does four things:
@@ -106,8 +79,10 @@ The machine then appears in DefectDojo under **Products**.
 You can also upload by hand without installing anything:
 
 ```bash
-sudo python3 ~/linux_scanner/defectdojo/vulnagent-dojo.py --url http://<vm-ip>:8080 --token <your-token>
+sudo python3 ~/linux_scanner/defectdojo/vulnagent-dojo.py --url https://<vm-ip>:8443 --token <your-token>
 ```
+
+Without a config file, the certificate is checked against the machine's trusted CAs. On Debian and Ubuntu, add the server's CA once with `sudo cp defectdojo-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`.
 
 ### Many machines at once
 

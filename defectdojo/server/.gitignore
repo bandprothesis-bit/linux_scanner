@@ -1,0 +1,5 @@
+# secrets and data written by setup.sh and backup.sh
+.env
+ca/
+certs/
+backups/
