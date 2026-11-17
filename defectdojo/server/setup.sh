@@ -24,13 +24,14 @@ Usage: sudo ./setup.sh [options]
   --install-docker   Install Docker and the Compose plugin with apt (Debian, Ubuntu).
   --renew-cert       Issue a new server certificate from the local CA (keeps the CA).
   --agent-token      Only print the API key of the "vulnagent" user again.
+  --new-agent-token  Replace that key with a new one (the old key stops working).
   --no-agent-user    Don't create the "vulnagent" API user.
   --no-pull          Don't download the images (they were loaded with docker load).
   -h, --help         This help.
 EOF
 }
 
-HOST=""; HTTP=0; INSTALL_DOCKER=0; RENEW=0; TOKEN_ONLY=0; AGENT_USER=1; PULL=1
+HOST=""; HTTP=0; INSTALL_DOCKER=0; RENEW=0; TOKEN_ONLY=0; NEW_TOKEN=0; AGENT_USER=1; PULL=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --host) HOST=${2:?--host needs a value}; shift 2 ;;
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
         --install-docker) INSTALL_DOCKER=1; shift ;;
         --renew-cert) RENEW=1; shift ;;
         --agent-token) TOKEN_ONLY=1; shift ;;
+        --new-agent-token) TOKEN_ONLY=1; NEW_TOKEN=1; shift ;;
         --no-agent-user) AGENT_USER=0; shift ;;
         --no-pull) PULL=0; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -57,7 +59,8 @@ rand() { local s=""; while [ ${#s} -lt "$1" ]; do s+=$(head -c 96 /dev/urandom |
 
 # the agent API user: get or create, Maintainer globally (it creates one product per machine)
 agent_token() {
-    docker compose exec -T uwsgi python manage.py shell 2>/dev/null <<'PY' | sed -n 's/^VULNAGENT_TOKEN=//p'
+    docker compose exec -T -e "VULNAGENT_NEW_TOKEN=$NEW_TOKEN" uwsgi python manage.py shell 2>/dev/null <<'PY' | sed -n 's/^VULNAGENT_TOKEN=//p'
+import os
 from dojo.models import Dojo_User
 from dojo.authorization.models import Global_Role, Role
 from rest_framework.authtoken.models import Token
@@ -71,6 +74,8 @@ gr, _ = Global_Role.objects.get_or_create(user=u, defaults={"role": role})
 if gr.role_id != role.id:
     gr.role = role
     gr.save()
+if os.environ.get("VULNAGENT_NEW_TOKEN") == "1":
+    Token.objects.filter(user=u).delete()
 t, _ = Token.objects.get_or_create(user=u)
 print("VULNAGENT_TOKEN=" + t.key)
 PY

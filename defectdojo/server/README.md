@@ -80,6 +80,7 @@ Run these in the folder, as root.
 | Restart after changing `.env` | `docker compose up -d` |
 | Reset the admin password | `docker compose exec uwsgi ./manage.py changepassword admin` |
 | Print the agents' API key again | `./setup.sh --agent-token` |
+| Replace the agents' API key | `./setup.sh --new-agent-token` (the old one stops working) |
 | New server certificate (it lasts 825 days) | `./setup.sh --renew-cert` |
 
 DefectDojo restarts by itself after a reboot.
@@ -182,7 +183,7 @@ Python settings that have no variable go into `extra_settings/` (see the README 
 ## Security notes
 
 - **Docker bypasses the host firewall.** Ports that Docker publishes are not blocked by `ufw` or firewalld rules. To limit who can reach DefectDojo, use the network's firewall, a cloud security group, rules in iptables' `DOCKER-USER` chain, or `DD_BIND_ADDRESS`.
-- **Rights of the `vulnagent` user.** It has the global role Maintainer, which can create, change and delete products, findings and engagements. Rotate its key if a machine with the key is lost: in DefectDojo, open the user, then *API v2 Key*, then *Generate New Key*. Then update the agents.
+- **Rights of the `vulnagent` user.** It has the global role Maintainer, which can create, change and delete products, findings and engagements. If a machine with the key is lost, replace the key with `./setup.sh --new-agent-token`: the old key stops working at once. Then update the agents with the new one.
 - **The admin password** printed by `setup.sh` is also in `.env`. Change it after the first login. The one in `.env` is only used on the very first start.
 - **Changing the registry.** `DD_IMAGE_REGISTRY=registry.defectdojo.com` pulls through DefectDojo's registry instead. It avoids Docker Hub's rate limits, but logs your pulls.
 
